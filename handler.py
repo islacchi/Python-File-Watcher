@@ -47,6 +47,32 @@ def get_file_info(path: str) -> tuple:
         return None, None
 
 
+def classify_path_change(src: str, dest: str) -> str:
+    """
+    Determines whether a path change is a MOVED, RENAMED, or MOVED_AND_RENAMED
+    by comparing the parent directory and filename of both paths.
+
+    Rules:
+      - Same folder + different filename   → RENAMED
+      - Different folder + same filename   → MOVED
+      - Different folder + different name  → MOVED_AND_RENAMED
+    """
+    src_dir   = os.path.dirname(os.path.abspath(src))
+    dest_dir  = os.path.dirname(os.path.abspath(dest))
+    src_name  = os.path.basename(src)
+    dest_name = os.path.basename(dest)
+
+    same_dir  = src_dir  == dest_dir
+    same_name = src_name == dest_name
+
+    if same_dir and not same_name:
+        return "RENAMED"
+    elif not same_dir and same_name:
+        return "MOVED"
+    else:
+        return "MOVED_AND_RENAMED"
+
+
 # ------------------------------------------------------------------
 # WATCHDOG EVENT HANDLER
 # ------------------------------------------------------------------
@@ -137,9 +163,10 @@ class FileWatchHandler(FileSystemEventHandler):
             self._clean_pending_deletes()
 
             if file_hash and file_hash in self.pending_deletes:
-                # Hash match → this is a MOVE, not a fresh create
+                # Hash match → classify as MOVED, RENAMED, or MOVED_AND_RENAMED
                 old_path, _ = self.pending_deletes.pop(file_hash)
-                self.db.log_event("MOVED", old_path, dest_path=path,
+                event_type = classify_path_change(old_path, path)
+                self.db.log_event(event_type, old_path, dest_path=path,
                                   file_size=size, md5_hash=file_hash)
                 self.db.delete_snapshot(old_path)
             else:
@@ -212,7 +239,8 @@ class FileWatchHandler(FileSystemEventHandler):
         file_hash = compute_hash(dest, self.hash_algorithm)
         size, mtime = get_file_info(dest)
 
-        self.db.log_event("MOVED", src, dest_path=dest,
+        event_type = classify_path_change(src, dest)
+        self.db.log_event(event_type, src, dest_path=dest,
                           file_size=size, md5_hash=file_hash)
         self.db.delete_snapshot(src)
 

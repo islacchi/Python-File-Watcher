@@ -123,7 +123,9 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
         if new_hash and new_hash in deleted_by_hash:
             old_path = deleted_by_hash[new_hash]
             info = current_snapshot[path]
-            db.log_event("MOVED (offline)", old_path, dest_path=path,
+            from handler import classify_path_change
+            event_type = classify_path_change(old_path, path) + " (offline)"
+            db.log_event(event_type, old_path, dest_path=path,
                          file_size=info["size"], md5_hash=new_hash)
             db.delete_snapshot(old_path)
             db.upsert_snapshot(path, info["size"], info["mtime"], new_hash)
