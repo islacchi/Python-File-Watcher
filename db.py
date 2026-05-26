@@ -1,0 +1,132 @@
+"""
+db.py — Database layer
+Handles all SQLite operations for two purposes:
+  1. snapshots table  → stores the last known state of every watched file
+  2. events table     → stores a permanent log of every change detected
+"""
+
+import sqlite3
+from datetime import datetime
+
+
+class Database:
+    def __init__(self, db_path: str):
+        """
+        Opens (or creates) the SQLite database at db_path.
+        check_same_thread=False is required because watchdog fires events
+        on background threads, not the main thread.
+        """
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._create_tables()
+
+    # ------------------------------------------------------------------
+    # SETUP
+    # ------------------------------------------------------------------
+
+    def _create_tables(self):
+        """
+        Creates both tables if they don't exist yet.
+        Safe to call on every startup — IF NOT EXISTS prevents duplicates.
+        """
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                path        TEXT    UNIQUE NOT NULL,
+                size        INTEGER,
+                mtime       REAL,
+                md5_hash    TEXT,
+                last_seen   TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                event_type  TEXT    NOT NULL,
+                src_path    TEXT    NOT NULL,
+                dest_path   TEXT,
+                file_size   INTEGER,
+                md5_hash    TEXT
+            );
+        """)
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # SNAPSHOT OPERATIONS
+    # ------------------------------------------------------------------
+
+    def upsert_snapshot(self, path: str, size: int, mtime: float, md5_hash: str):
+        """
+        INSERT or UPDATE a file's record in the snapshot table.
+        ON CONFLICT(path) means: if this path already exists, update it.
+        This keeps only the LATEST known state per file path.
+        """
+        now = datetime.now().isoformat()
+        self.conn.execute("""
+            INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size      = excluded.size,
+                mtime     = excluded.mtime,
+                md5_hash  = excluded.md5_hash,
+                last_seen = excluded.last_seen
+        """, (path, size, mtime, md5_hash, now))
+        self.conn.commit()
+
+    def delete_snapshot(self, path: str):
+        """
+        Removes a file from the snapshot table.
+        Called when a file is confirmed deleted or moved away from its old path.
+        """
+        self.conn.execute("DELETE FROM snapshots WHERE path = ?", (path,))
+        self.conn.commit()
+
+    def get_all_snapshots(self) -> dict:
+        """
+        Returns the entire snapshot table as a dictionary:
+        { filepath: { size, mtime, md5_hash } }
+        Used during startup diff to compare against the current directory state.
+        """
+        cursor = self.conn.execute(
+            "SELECT path, size, mtime, md5_hash FROM snapshots"
+        )
+        return {
+            row[0]: {"size": row[1], "mtime": row[2], "md5_hash": row[3]}
+            for row in cursor.fetchall()
+        }
+
+    # ------------------------------------------------------------------
+    # EVENT LOG OPERATIONS
+    # ------------------------------------------------------------------
+
+    def log_event(
+        self,
+        event_type: str,
+        src_path: str,
+        dest_path: str = None,
+        file_size: int = None,
+        md5_hash: str = None,
+    ):
+        """
+        Appends one row to the events table and prints it to the console.
+        dest_path is only used for MOVED/RENAMED events.
+        """
+        timestamp = datetime.now().isoformat()
+        self.conn.execute("""
+            INSERT INTO events (timestamp, event_type, src_path, dest_path, file_size, md5_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash))
+        self.conn.commit()
+
+        # Console output for visibility
+        if dest_path:
+            print(f"[{timestamp}] {event_type}: {src_path}  →  {dest_path}")
+        else:
+            print(f"[{timestamp}] {event_type}: {src_path}")
+
+    # ------------------------------------------------------------------
+    # CLEANUP
+    # ------------------------------------------------------------------
+
+    def close(self):
+        self.conn.close()
