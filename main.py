@@ -12,10 +12,11 @@ import os
 import sys
 import time
 import configparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
 
 from db import Database
-from handler import FileWatchHandler, compute_hash, get_file_info
+from handler import FileWatchHandler, compute_hash, get_file_info, classify_path_change
 
 
 # ------------------------------------------------------------------
@@ -41,15 +42,25 @@ def load_config(config_path: str = "config.ini") -> configparser.ConfigParser:
 # ------------------------------------------------------------------
 
 def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
-                   hash_algorithm: str, recursive: bool) -> dict:
+                   hash_algorithm: str, recursive: bool,
+                   old_snapshot: dict = None) -> dict:
     """
     Walks the watch_directory right now and returns its current state as:
     { filepath: { size, mtime, md5_hash } }
 
-    This is the "ground truth" snapshot of what actually exists on disk.
-    We compare it against the last saved snapshot in SQLite to find changes.
+    Performance optimisations:
+      1. mtime pre-filter  — if a file's size and mtime match the last snapshot,
+                             reuse the stored hash instead of re-hashing the file.
+                             Skips hashing for unchanged files on repeat startups.
+      2. Parallel hashing  — files that DO need hashing are processed concurrently
+                             using a thread pool, reducing total scan time on large
+                             network drives.
     """
-    current = {}
+    if old_snapshot is None:
+        old_snapshot = {}
+
+    # --- Phase 1: walk the directory and collect candidate file paths ---
+    candidates = []  # (path, size, mtime) for files that passed the filter
 
     walker = os.walk(watch_dir) if recursive else [
         (watch_dir, [], os.listdir(watch_dir))
@@ -57,19 +68,49 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
 
     for root, _dirs, files in walker:
         for filename in files:
-            # Skip ignored prefixes
             if any(prefix and filename.startswith(prefix) for prefix in ignore_prefixes):
                 continue
-
             ext = os.path.splitext(filename)[1].lower()
             if ext not in watch_extensions:
                 continue
-
             path = os.path.join(root, filename)
             size, mtime = get_file_info(path)
-            file_hash = compute_hash(path, hash_algorithm)
-
             if size is not None:
+                candidates.append((path, size, mtime))
+
+    current = {}
+    to_hash = []   # files that need fresh hashing
+    skipped = 0    # counter for logging
+
+    # --- Phase 2: mtime pre-filter ---
+    # If size AND mtime match the snapshot, the file hasn't changed —
+    # reuse the stored hash without reading the file at all.
+    for path, size, mtime in candidates:
+        snap = old_snapshot.get(path)
+        if snap and snap["size"] == size and snap["mtime"] == mtime and snap["md5_hash"]:
+            current[path] = {"size": size, "mtime": mtime, "md5_hash": snap["md5_hash"]}
+            skipped += 1
+        else:
+            to_hash.append((path, size, mtime))
+
+    print(f"[STARTUP] {skipped} file(s) unchanged (skipped hashing). "
+          f"{len(to_hash)} file(s) need hashing...")
+
+    # --- Phase 3: parallel hashing for files that need it ---
+    # 8 threads is a reasonable ceiling for network drives;
+    # more threads won't help if the bottleneck is network bandwidth.
+    if to_hash:
+        max_workers = min(8, len(to_hash))
+
+        def hash_file(args):
+            path, size, mtime = args
+            file_hash = compute_hash(path, hash_algorithm)
+            return path, size, mtime, file_hash
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(hash_file, item): item for item in to_hash}
+            for future in as_completed(futures):
+                path, size, mtime, file_hash = future.result()
                 current[path] = {"size": size, "mtime": mtime, "md5_hash": file_hash}
 
     return current
@@ -95,7 +136,8 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
 
     old_snapshot     = db.get_all_snapshots()           # what SQLite remembers
     current_snapshot = scan_directory(                  # what's on disk right now
-        watch_dir, watch_ext, ignore_pfx, hash_algorithm, recursive
+        watch_dir, watch_ext, ignore_pfx, hash_algorithm, recursive,
+        old_snapshot=old_snapshot                       # passed in for mtime pre-filter
     )
 
     old_paths     = set(old_snapshot.keys())
@@ -123,7 +165,6 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
         if new_hash and new_hash in deleted_by_hash:
             old_path = deleted_by_hash[new_hash]
             info = current_snapshot[path]
-            from handler import classify_path_change
             event_type = classify_path_change(old_path, path) + " (offline)"
             db.log_event(event_type, old_path, dest_path=path,
                          file_size=info["size"], md5_hash=new_hash)
