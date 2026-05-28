@@ -3,6 +3,7 @@
 Monitors a directory for changes to Excel, Word, PDF, and image files.
 Logs all events (create, modify, delete, rename, move) to a SQLite database.
 Detects changes that occurred while the script was not running on every restart.
+Auto-recovers if the watched drive goes offline.
 
 ---
 
@@ -14,6 +15,9 @@ filewatcher/
 ├── main.py           ← entry point
 ├── db.py             ← SQLite database layer
 ├── handler.py        ← live watchdog event handler
+├── logger.py         ← centralized logging setup
+├── query.py          ← CLI tool for reading logs
+├── .gitignore        ← excludes cache, db, and log files from git
 └── requirements.txt  ← Python dependencies
 ```
 
@@ -33,11 +37,12 @@ pip install -r requirements.txt
 ### 3. Edit config.ini
 Change at minimum:
 - `watch_directory` → the folder you want to monitor (can be a network drive e.g. `K:\`)
-- `log_directory`   → where the SQLite database will be saved (keep OUTSIDE watch_directory)
+- `log_directory`   → where the SQLite database and log file will be saved (keep OUTSIDE watch_directory)
 
-> **Note:** If `watch_directory` points to a large drive or network share, the first startup
-> scan will take longer as it hashes all matching files. Consider pointing to a specific
-> subfolder instead of the root of a drive.
+> **Note on large drives:** If `watch_directory` points to the root of a large drive or
+> network share, the first startup scan will take longer as it hashes all matching files.
+> The terminal will show an estimated time to completion and progress updates every 50 files.
+> Every subsequent startup is significantly faster due to the mtime pre-filter.
 
 ### 4. Run manually to test
 ```
@@ -46,36 +51,57 @@ python main.py
 
 ---
 
-## Task Scheduler Setup (Windows)
+## Configuration Reference
 
-To run automatically on startup:
+All settings live in `config.ini`. No code changes needed.
 
-1. Open Task Scheduler → Create Task
-2. **General tab**
-   - Name: File Watcher
-   - Check: "Run whether user is logged on or not"
-   - Check: "Run with highest privileges"
+| Setting | Section | Default | Description |
+|---|---|---|---|
+| `watch_directory` | `[watcher]` | — | Full path to the directory to monitor |
+| `recursive` | `[watcher]` | `true` | Watch subdirectories recursively |
+| `reconnect_delay` | `[watcher]` | `30` | Seconds to wait before retrying if drive goes offline |
+| `watch_extensions` | `[filters]` | see file | Whitelist of file extensions to track |
+| `ignore_prefixes` | `[filters]` | `~$, .~, ~` | Filename prefixes to ignore (Office lock files) |
+| `log_directory` | `[storage]` | — | Where to save `filelog.db` and `filewatcher.log` |
+| `db_name` | `[storage]` | `filelog.db` | SQLite database filename |
+| `retention_days` | `[storage]` | `90` | Days to keep events before auto-purge (0 = keep forever) |
+| `hash_algorithm` | `[snapshot]` | `md5` | Hashing algorithm for file fingerprinting |
 
-3. **Triggers tab**
-   - New trigger → At startup
+---
 
-4. **Actions tab**
-   - Action: Start a program
-   - Program: `C:\Python312\python.exe`   (use your actual Python path — run `where python` to find it)
-   - Arguments: `main.py`
-   - Start in: `C:\path\to\filewatcher`   (full path to this folder)
+## Log Files
 
-5. **Settings tab**
-   - UNCHECK: "Stop the task if it runs longer than 3 days"
-   - Select: "Do not start a new instance" if already running
+Two log outputs are written to `log_directory` on every run:
+
+- **`filelog.db`** — SQLite database containing all file change events and the current snapshot
+- **`filewatcher.log`** — rotating text log of all script activity including startup, errors, and reconnects. Rotates at 5MB, keeps last 5 files.
 
 ---
 
 ## Reading the Logs
 
-The SQLite database at your `log_directory` can be opened with:
-- DB Browser for SQLite (free GUI): https://sqlitebrowser.org
-- Or query directly in Python:
+### Option 1 — CLI query tool (quickest)
+
+```bash
+python query.py                          # last 50 events
+python query.py --limit 100             # show more results
+python query.py --type DELETED          # filter by event type
+python query.py --type RENAMED          # filter by event type
+python query.py --file budget.xlsx      # search by filename
+python query.py --today                 # events from today only
+python query.py --date 2026-05-26       # events from a specific date
+python query.py --summary               # count of each event type
+```
+
+Filters stack — `--type DELETED --today` shows only today's deletes.
+
+### Option 2 — DB Browser for SQLite (visual)
+
+Download free from https://sqlitebrowser.org. Open `filelog.db` from your
+`log_directory`, click the **Browse Data** tab, and select the `events` or
+`snapshots` table from the dropdown.
+
+### Option 3 — Python directly
 
 ```python
 import sqlite3
@@ -84,15 +110,19 @@ for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50")
     print(row)
 ```
 
-### Events table columns
-| Column     | Description                                                        |
-|------------|--------------------------------------------------------------------|
-| timestamp  | ISO 8601 datetime of the event                                     |
-| event_type | See event types below                                              |
-| src_path   | File path where the event occurred (source path for renames/moves) |
-| dest_path  | Destination path — populated for RENAMED, MOVED, MOVED_AND_RENAMED |
-| file_size  | Size in bytes at time of event                                     |
-| md5_hash   | MD5 fingerprint of file contents                                   |
+---
+
+## Events Table Reference
+
+### Columns
+| Column     | Description                                                         |
+|------------|---------------------------------------------------------------------|
+| timestamp  | ISO 8601 datetime of the event                                      |
+| event_type | See event types table below                                         |
+| src_path   | File path where the event occurred (source path for renames/moves)  |
+| dest_path  | Destination path — populated for RENAMED, MOVED, MOVED_AND_RENAMED  |
+| file_size  | Size in bytes at time of event                                      |
+| md5_hash   | MD5 fingerprint of file contents                                    |
 
 ### Event types
 | Event type                    | Meaning                                              |
@@ -110,7 +140,7 @@ for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50")
 | `MOVED (offline)`             | File was moved while the script was not running      |
 | `MOVED_AND_RENAMED (offline)` | File was moved and renamed while script was off      |
 
-### Useful queries
+### Useful SQL queries
 
 **See only deleted files:**
 ```sql
@@ -131,6 +161,39 @@ SELECT * FROM events WHERE event_type LIKE '%offline%'
 ```sql
 SELECT * FROM events WHERE src_path LIKE '%filename.pdf%'
 ```
+
+**Events from a specific date:**
+```sql
+SELECT * FROM events WHERE timestamp LIKE '2026-05-26%'
+```
+
+---
+
+## Task Scheduler Setup (Windows)
+
+To run automatically on startup:
+
+1. Open Task Scheduler → Create Task
+2. **General tab**
+   - Name: File Watcher
+   - Check: "Run whether user is logged on or not"
+   - Check: "Run with highest privileges"
+
+3. **Triggers tab**
+   - New trigger → At startup
+
+4. **Actions tab**
+   - Action: Start a program
+   - Program: `C:\Python312\python.exe` (run `where python` to find your actual path)
+   - Arguments: `main.py`
+   - Start in: `C:\path\to\filewatcher` (full path to this folder)
+
+5. **Settings tab**
+   - UNCHECK: "Stop the task if it runs longer than 3 days"
+   - Select: "Do not start a new instance" if already running
+
+> **Network drives:** If `K:\` is not mounted yet when the script starts at boot,
+> the script will wait patiently until the drive becomes available rather than crashing.
 
 ---
 
