@@ -106,7 +106,8 @@ class FileWatchHandler(FileSystemEventHandler):
         # If a CREATE arrives within move_window seconds with the same hash,
         # we log it as a MOVE instead of a DELETE + CREATE.
         self.pending_deletes: dict = {}
-        self.move_window: float = 2.0  # seconds to wait before confirming a delete
+        self.move_window: float = config["watcher"].getfloat("move_window", 2.0)
+        self.watch_directory: str = config["watcher"]["watch_directory"]
 
         # Lock prevents race conditions when multiple events fire simultaneously
         self._lock = threading.Lock()
@@ -209,11 +210,19 @@ class FileWatchHandler(FileSystemEventHandler):
     def on_deleted(self, event):
         """
         Fires when a file disappears.
-        We DON'T log it immediately — we store the hash in pending_deletes
-        and wait move_window seconds. If a matching CREATE arrives in time,
-        on_created() will claim it as a MOVE and clear the pending entry.
-        If nothing claims it after move_window, a background thread logs
-        it as a real DELETE.
+        Instead of waiting a fixed duration, a background thread polls the
+        watch directory every second for up to move_window seconds looking
+        for a file whose hash matches the deleted file's hash.
+
+        If a match is found before the window expires:
+          → logged as MOVED/RENAMED immediately when the copy finishes
+        If no match found after move_window seconds:
+          → logged as a genuine DELETE
+
+        This means a large file being moved across the network gets caught
+        as a MOVE the moment it finishes copying — not after a blind wait.
+        on_created() is still the primary path for fast moves — this polling
+        thread only matters when the copy takes longer than a single event cycle.
         """
         if event.is_directory or not self._should_watch(event.src_path):
             return
@@ -228,16 +237,65 @@ class FileWatchHandler(FileSystemEventHandler):
             if file_hash:
                 self.pending_deletes[file_hash] = (path, time.time())
 
-        # Background thread waits, then confirms delete if unclaimed
-        def delayed_delete_log():
-            time.sleep(self.move_window)
+        def poll_for_move():
+            """
+            Polls the watch directory every second for a file matching
+            file_hash. Stops as soon as a match is found or the window expires.
+            on_created() may claim the match first — in that case
+            file_hash will no longer be in pending_deletes and this
+            thread exits cleanly without double-logging.
+            """
+            deadline = time.time() + self.move_window
+            poll_interval = 1.0
+
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+
+                # on_created() already claimed this — exit cleanly
+                with self._lock:
+                    if file_hash not in self.pending_deletes:
+                        return
+
+                # Walk the watch directory looking for a file with the same hash
+                for root, _dirs, files in os.walk(self.watch_directory):
+                    for filename in files:
+                        candidate = os.path.join(root, filename)
+
+                        # Skip the original path and non-watched files
+                        if candidate == path:
+                            continue
+                        if not self._should_watch(candidate):
+                            continue
+
+                        candidate_hash = compute_hash(candidate, self.hash_algorithm)
+                        if candidate_hash == file_hash:
+                            # Found the file at its new location — log as move
+                            with self._lock:
+                                if file_hash not in self.pending_deletes:
+                                    return  # on_created() beat us to it
+                                self.pending_deletes.pop(file_hash, None)
+
+                            size, mtime = get_file_info(candidate)
+                            event_type = classify_path_change(path, candidate)
+                            self.db.log_event(
+                                event_type, path, dest_path=candidate,
+                                file_size=size, md5_hash=file_hash
+                            )
+                            self.db.delete_snapshot(path)
+                            if size is not None:
+                                self.db.upsert_snapshot(
+                                    candidate, size, mtime, file_hash
+                                )
+                            return
+
+            # Window expired with no match — confirm as genuine DELETE
             with self._lock:
                 if file_hash and file_hash in self.pending_deletes:
                     self.pending_deletes.pop(file_hash, None)
                     self.db.log_event("DELETED", path)
                     self.db.delete_snapshot(path)
 
-        threading.Thread(target=delayed_delete_log, daemon=True).start()
+        threading.Thread(target=poll_for_move, daemon=True).start()
 
     def on_moved(self, event):
         """

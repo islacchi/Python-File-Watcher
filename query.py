@@ -17,7 +17,7 @@ import sqlite3
 import argparse
 import os
 import sys
-from datetime import datetime, date
+from datetime import date
 
 
 # ------------------------------------------------------------------
