@@ -1,9 +1,21 @@
 # File Watcher
 
+![Python](https://img.shields.io/badge/python-3.10+-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-1-lightgrey)
+
 Monitors a directory for changes to Excel, Word, PDF, and image files.
 Logs all events (create, modify, delete, rename, move) to a SQLite database.
 Detects changes that occurred while the script was not running on every restart.
 Auto-recovers if the watched drive goes offline.
+
+---
+
+## Prerequisites
+
+- Python 3.10 or higher
+- `watchdog` — the only dependency, installed via `requirements.txt`
+- No database server, no running services, no XAMPP — SQLite is built into Python
 
 ---
 
@@ -21,31 +33,6 @@ filewatcher/
 └── requirements.txt  ← Python dependencies
 ```
 
----
-
-## Architecture
-
-The script runs in two phases on every startup, then stays alive for live monitoring.
-
-```mermaid
-flowchart TD
-    A([python main.py]) --> B[Load config.ini]
-    B --> C[Setup logging\nlogger.py]
-    C --> D{Watch dir available?}
-    D -- No --> D
-    D -- Yes --> E[Open database\ndb.py]
-    E --> F[Purge old events\ndb.py]
-    F --> G[Scan directory\nmain.py]
-    G --> H[Diff snapshot vs disk\nmain.py]
-    H --> I[Log offline events\ndb.py]
-    I --> J[Start watchdog observer\nhandler.py]
-    J --> K[File system event fires]
-    K --> L{Passes filter?}
-    L -- No --> K
-    L -- Yes --> M[Classify event\nhandler.py]
-    M --> N[Log live event\ndb.py]
-    N --> K
-```
 ---
 
 ## Setup
@@ -191,6 +178,78 @@ SELECT * FROM events WHERE src_path LIKE '%filename.pdf%'
 ```sql
 SELECT * FROM events WHERE timestamp LIKE '2026-05-26%'
 ```
+
+---
+
+## Architecture
+
+```
+python main.py
+      │
+      ▼
+Load config.ini          [main.py]
+      │
+      ▼
+Setup logging            [logger.py]  → filewatcher.log + console
+      │
+      ▼
+Watch dir available?     [main.py]    → waits if K:\ not mounted yet
+      │
+      ▼
+Open / create database   [db.py]      → filelog.db, creates tables
+      │
+      ▼
+Purge old events         [db.py]      → deletes rows older than retention_days
+      │
+      ▼
+── STARTUP DIFF ──────────────────────────────────────────────────
+      │
+      ▼
+Scan watch directory     [main.py]    → mtime pre-filter → sample 5 → ETA
+      │                               → parallel hash remaining files
+      ▼
+Diff snapshot vs disk    [main.py]    → hash match: RENAMED / MOVED /
+      │                                 MOVED_AND_RENAMED / CREATED / DELETED
+      ▼
+Log offline events       [db.py]      → db.log_event() + update snapshots
+      │
+      ▼
+── LIVE WATCHER ──────────────────────────────────────────────────
+      │
+      ▼
+Watchdog observer starts [handler.py] → attached to watch_dir
+      │
+      ▼ (loops on every file system event)
+File system event fires  [handler.py] → on_created / on_modified
+      │                                  on_deleted / on_moved
+      ▼
+Extension + prefix filter             → skip ~$ prefixes, check whitelist
+      │
+      ▼
+Classify event           [handler.py] → DELETED waits 2s pending buffer
+      │                               → hash match → RENAMED / MOVED
+      ▼
+Log live event           [db.py]      → db.log_event() + upsert_snapshot()
+      │
+      └──────────────────────────────── loops back to next event
+
+── QUERY (separate tool) ─────────────────────────────────────────
+
+python query.py          [query.py]   → reads filelog.db directly
+                                      → filter by type, file, date
+```
+
+---
+
+## Known Limitations
+
+- **First run on large drives is slow** — every matching file must be MD5 hashed to build the initial snapshot. On a network drive with thousands of files this can take several minutes. Every run after the first is fast due to the mtime pre-filter.
+
+- **Move detection has a 2-second window** — when a file is deleted and recreated (cross-folder move), the script waits 2 seconds to match the hashes. If the new file appears after 2 seconds, the event is logged as a DELETE + CREATE instead of a MOVE. This window is intentionally short to keep live logging responsive.
+
+- **Network drive hashing is slower than local** — MD5 hashing over a network connection is limited by network bandwidth, not disk speed. Pointing `watch_directory` to a specific subfolder rather than the drive root significantly reduces startup time.
+
+- **No content logging** — the script records that a file changed and its MD5 hash, but does not store the file's contents or a diff of what changed inside it.
 
 ---
 
