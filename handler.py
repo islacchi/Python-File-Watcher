@@ -12,6 +12,9 @@ import time
 import hashlib
 import threading
 from watchdog.events import FileSystemEventHandler
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 # ------------------------------------------------------------------
