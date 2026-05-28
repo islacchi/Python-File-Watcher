@@ -23,6 +23,31 @@ filewatcher/
 
 ---
 
+## Architecture
+
+The script runs in two phases on every startup, then stays alive for live monitoring.
+
+```mermaid
+flowchart TD
+    A([python main.py]) --> B[Load config.ini]
+    B --> C[Setup logging\nlogger.py]
+    C --> D{Watch dir available?}
+    D -- No --> D
+    D -- Yes --> E[Open database\ndb.py]
+    E --> F[Purge old events\ndb.py]
+    F --> G[Scan directory\nmain.py]
+    G --> H[Diff snapshot vs disk\nmain.py]
+    H --> I[Log offline events\ndb.py]
+    I --> J[Start watchdog observer\nhandler.py]
+    J --> K[File system event fires]
+    K --> L{Passes filter?}
+    L -- No --> K
+    L -- Yes --> M[Classify event\nhandler.py]
+    M --> N[Log live event\ndb.py]
+    N --> K
+```
+---
+
 ## Setup
 
 ### 1. Install Python 3.10+
