@@ -22,6 +22,7 @@ class Database:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._create_tables()
+        self._migrate()
 
     # ------------------------------------------------------------------
     # SETUP
@@ -49,14 +50,47 @@ class Database:
                 src_path    TEXT    NOT NULL,
                 dest_path   TEXT,
                 file_size   INTEGER,
-                md5_hash    TEXT
+                md5_hash    TEXT,
+                prev_hash   TEXT
             );
+            -- Add prev_hash to existing databases that predate this column
+            -- This is a no-op if the column already exists
+            PRAGMA legacy_alter_table = ON;
         """)
         self.conn.commit()
+
+    def _migrate(self):
+        """
+        Adds prev_hash column to the events table if it does not exist yet.
+        Handles databases created before this column was introduced — safe
+        to call on every startup, does nothing if column already exists.
+        """
+        existing = {
+            row[1] for row in
+            self.conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "prev_hash" not in existing:
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN prev_hash TEXT"
+            )
+            self.conn.commit()
+            log.info("Migrated events table: added prev_hash column.")
 
     # ------------------------------------------------------------------
     # SNAPSHOT OPERATIONS
     # ------------------------------------------------------------------
+
+    def get_snapshot_hash(self, path: str) -> str | None:
+        """
+        Returns the stored md5_hash for a single file path from the snapshot.
+        Used by on_modified to capture the previous hash before overwriting it.
+        Returns None if the file is not in the snapshot yet.
+        """
+        cursor = self.conn.execute(
+            "SELECT md5_hash FROM snapshots WHERE path = ?", (path,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def upsert_snapshot(self, path: str, size: int, mtime: float, md5_hash: str):
         """
@@ -109,16 +143,19 @@ class Database:
         dest_path: str = None,
         file_size: int = None,
         md5_hash: str = None,
+        prev_hash: str = None,
     ):
         """
         Appends one row to the events table and writes to the logger.
         dest_path is only used for MOVED/RENAMED events.
+        prev_hash is the hash of the file before a MODIFIED event — allows
+        before/after comparison without storing file contents.
         """
         timestamp = datetime.now().isoformat()
         self.conn.execute("""
-            INSERT INTO events (timestamp, event_type, src_path, dest_path, file_size, md5_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash))
+            INSERT INTO events (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash))
         self.conn.commit()
 
         if dest_path:

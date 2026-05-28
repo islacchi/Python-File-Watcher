@@ -41,7 +41,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
 
 def format_row(row: tuple) -> str:
     """Formats a single event row for readable terminal output."""
-    id_, timestamp, event_type, src_path, dest_path, file_size, md5_hash = row
+    id_, timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash = row
     size_str = f"{file_size:,} bytes" if file_size else "N/A"
 
     if dest_path:
@@ -49,6 +49,12 @@ def format_row(row: tuple) -> str:
                 f"  FROM : {src_path}\n"
                 f"  TO   : {dest_path}\n"
                 f"  SIZE : {size_str}\n")
+    elif event_type in ("MODIFIED", "MODIFIED (offline)") and prev_hash:
+        return (f"[{timestamp}] {event_type}\n"
+                f"  PATH : {src_path}\n"
+                f"  SIZE : {size_str}\n"
+                f"  BEFORE: {prev_hash}\n"
+                f"  AFTER : {md5_hash}\n")
     else:
         return (f"[{timestamp}] {event_type}\n"
                 f"  PATH : {src_path}\n"
@@ -86,7 +92,7 @@ def query_events(conn: sqlite3.Connection, event_type: str = None,
     params.append(limit)
 
     query = f"""
-        SELECT id, timestamp, event_type, src_path, dest_path, file_size, md5_hash
+        SELECT id, timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash
         FROM events
         {where}
         ORDER BY timestamp DESC

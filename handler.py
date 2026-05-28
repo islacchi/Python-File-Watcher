@@ -1,251 +1,194 @@
 """
-handler.py — Live event handler
-Plugs into watchdog's Observer and responds to file system events in real time.
-Responsibilities:
-  - Filter events by extension whitelist and ignore_prefixes
-  - Detect actual moves vs. phantom delete+create pairs
-  - Update the snapshot and log every event to the database
+db.py — Database layer
+Handles all SQLite operations for two purposes:
+  1. snapshots table  → stores the last known state of every watched file
+  2. events table     → stores a permanent log of every change detected
 """
 
-import os
-import time
-import hashlib
-import threading
-from watchdog.events import FileSystemEventHandler
+import sqlite3
+from datetime import datetime, timedelta
 from logger import get_logger
 
 log = get_logger(__name__)
 
 
-# ------------------------------------------------------------------
-# UTILITY FUNCTIONS
-# ------------------------------------------------------------------
+class Database:
+    def __init__(self, db_path: str):
+        """
+        Opens (or creates) the SQLite database at db_path.
+        check_same_thread=False is required because watchdog fires events
+        on background threads, not the main thread.
+        """
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._create_tables()
+        self._migrate()
 
-def compute_hash(path: str, algorithm: str = "md5") -> str | None:
-    """
-    Reads a file in binary chunks and returns its hash digest.
-    Chunked reading (8192 bytes at a time) avoids loading large files
-    entirely into memory.
-    Returns None if the file can't be read (e.g. it was deleted mid-hash).
-    """
-    h = hashlib.new(algorithm)
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except (IOError, OSError):
-        return None
+    # ------------------------------------------------------------------
+    # SETUP
+    # ------------------------------------------------------------------
 
+    def _create_tables(self):
+        """
+        Creates both tables if they don't exist yet.
+        Safe to call on every startup — IF NOT EXISTS prevents duplicates.
+        """
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                path        TEXT    UNIQUE NOT NULL,
+                size        INTEGER,
+                mtime       REAL,
+                md5_hash    TEXT,
+                last_seen   TEXT
+            );
 
-def get_file_info(path: str) -> tuple:
-    """
-    Returns (size_in_bytes, modification_timestamp) for a file.
-    Returns (None, None) if the file is inaccessible.
-    """
-    try:
-        stat = os.stat(path)
-        return stat.st_size, stat.st_mtime
-    except OSError:
-        return None, None
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT    NOT NULL,
+                event_type  TEXT    NOT NULL,
+                src_path    TEXT    NOT NULL,
+                dest_path   TEXT,
+                file_size   INTEGER,
+                md5_hash    TEXT,
+                prev_hash   TEXT
+            );
+            -- Add prev_hash to existing databases that predate this column
+            -- This is a no-op if the column already exists
+            PRAGMA legacy_alter_table = ON;
+        """)
+        self.conn.commit()
 
+    def _migrate(self):
+        """
+        Adds prev_hash column to the events table if it does not exist yet.
+        Handles databases created before this column was introduced — safe
+        to call on every startup, does nothing if column already exists.
+        """
+        existing = {
+            row[1] for row in
+            self.conn.execute("PRAGMA table_info(events)").fetchall()
+        }
+        if "prev_hash" not in existing:
+            self.conn.execute(
+                "ALTER TABLE events ADD COLUMN prev_hash TEXT"
+            )
+            self.conn.commit()
+            log.info("Migrated events table: added prev_hash column.")
 
-def classify_path_change(src: str, dest: str) -> str:
-    """
-    Determines whether a path change is a MOVED, RENAMED, or MOVED_AND_RENAMED
-    by comparing the parent directory and filename of both paths.
+    # ------------------------------------------------------------------
+    # SNAPSHOT OPERATIONS
+    # ------------------------------------------------------------------
 
-    Rules:
-      - Same folder + different filename   → RENAMED
-      - Different folder + same filename   → MOVED
-      - Different folder + different name  → MOVED_AND_RENAMED
-    """
-    src_dir   = os.path.dirname(os.path.abspath(src))
-    dest_dir  = os.path.dirname(os.path.abspath(dest))
-    src_name  = os.path.basename(src)
-    dest_name = os.path.basename(dest)
-
-    same_dir  = src_dir  == dest_dir
-    same_name = src_name == dest_name
-
-    if same_dir and not same_name:
-        return "RENAMED"
-    elif not same_dir and same_name:
-        return "MOVED"
-    else:
-        return "MOVED_AND_RENAMED"
-
-
-# ------------------------------------------------------------------
-# WATCHDOG EVENT HANDLER
-# ------------------------------------------------------------------
-
-class FileWatchHandler(FileSystemEventHandler):
-    """
-    Subclass of watchdog's FileSystemEventHandler.
-    watchdog calls on_created / on_modified / on_deleted / on_moved
-    automatically whenever the OS fires a matching file system event.
-    """
-
-    def __init__(self, db, config):
-        # Build a set of lowercase extensions for fast O(1) lookup
-        self.watch_extensions = set(
-            config["filters"]["watch_extensions"].replace(" ", "").split(",")
+    def get_snapshot_hash(self, path: str) -> str | None:
+        """
+        Returns the stored md5_hash for a single file path from the snapshot.
+        Used by on_modified to capture the previous hash before overwriting it.
+        Returns None if the file is not in the snapshot yet.
+        """
+        cursor = self.conn.execute(
+            "SELECT md5_hash FROM snapshots WHERE path = ?", (path,)
         )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
-        # List of filename prefixes to ignore (e.g. ~$, .~)
-        self.ignore_prefixes = (
-            config["filters"]["ignore_prefixes"].replace(" ", "").split(",")
+    def upsert_snapshot(self, path: str, size: int, mtime: float, md5_hash: str):
+        """
+        INSERT or UPDATE a file's record in the snapshot table.
+        ON CONFLICT(path) means: if this path already exists, update it.
+        This keeps only the LATEST known state per file path.
+        """
+        now = datetime.now().isoformat()
+        self.conn.execute("""
+            INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size      = excluded.size,
+                mtime     = excluded.mtime,
+                md5_hash  = excluded.md5_hash,
+                last_seen = excluded.last_seen
+        """, (path, size, mtime, md5_hash, now))
+        self.conn.commit()
+
+    def delete_snapshot(self, path: str):
+        """
+        Removes a file from the snapshot table.
+        Called when a file is confirmed deleted or moved away from its old path.
+        """
+        self.conn.execute("DELETE FROM snapshots WHERE path = ?", (path,))
+        self.conn.commit()
+
+    def get_all_snapshots(self) -> dict:
+        """
+        Returns the entire snapshot table as a dictionary:
+        { filepath: { size, mtime, md5_hash } }
+        Used during startup diff to compare against the current directory state.
+        """
+        cursor = self.conn.execute(
+            "SELECT path, size, mtime, md5_hash FROM snapshots"
         )
-
-        self.hash_algorithm = config["snapshot"]["hash_algorithm"]
-        self.db = db
-
-        # Move detection buffer: { md5_hash: (original_path, timestamp) }
-        # When a DELETE fires, we store the file's hash here and wait.
-        # If a CREATE arrives within move_window seconds with the same hash,
-        # we log it as a MOVE instead of a DELETE + CREATE.
-        self.pending_deletes: dict = {}
-        self.move_window: float = 2.0  # seconds to wait before confirming a delete
-
-        # Lock prevents race conditions when multiple events fire simultaneously
-        self._lock = threading.Lock()
+        return {
+            row[0]: {"size": row[1], "mtime": row[2], "md5_hash": row[3]}
+            for row in cursor.fetchall()
+        }
 
     # ------------------------------------------------------------------
-    # FILTER
+    # EVENT LOG OPERATIONS
     # ------------------------------------------------------------------
 
-    def _should_watch(self, path: str) -> bool:
+    def log_event(
+        self,
+        event_type: str,
+        src_path: str,
+        dest_path: str = None,
+        file_size: int = None,
+        md5_hash: str = None,
+        prev_hash: str = None,
+    ):
         """
-        Returns True only if the file:
-          1. Does NOT start with any ignored prefix
-          2. Has an extension in our whitelist
+        Appends one row to the events table and writes to the logger.
+        dest_path is only used for MOVED/RENAMED events.
+        prev_hash is the hash of the file before a MODIFIED event — allows
+        before/after comparison without storing file contents.
         """
-        filename = os.path.basename(path)
-        ext = os.path.splitext(filename)[1].lower()
+        timestamp = datetime.now().isoformat()
+        self.conn.execute("""
+            INSERT INTO events (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash))
+        self.conn.commit()
 
-        for prefix in self.ignore_prefixes:
-            if prefix and filename.startswith(prefix):
-                return False
-
-        return ext in self.watch_extensions
-
-    # ------------------------------------------------------------------
-    # MOVE DETECTION HELPERS
-    # ------------------------------------------------------------------
-
-    def _clean_pending_deletes(self):
-        """Removes expired entries from the pending_deletes buffer."""
-        now = time.time()
-        expired = [
-            h for h, (_, t) in self.pending_deletes.items()
-            if now - t > self.move_window
-        ]
-        for h in expired:
-            del self.pending_deletes[h]
+        if dest_path:
+            log.info("%s: %s  →  %s", event_type, src_path, dest_path)
+        else:
+            log.info("%s: %s", event_type, src_path)
 
     # ------------------------------------------------------------------
-    # WATCHDOG CALLBACKS
+    # RETENTION / CLEANUP
     # ------------------------------------------------------------------
 
-    def on_created(self, event):
+    def purge_old_events(self, retention_days: int):
         """
-        Fires when a new file appears.
-        Before logging as CREATED, check if it matches a pending delete —
-        if so, it's actually a MOVE (file moved from outside the watched dir
-        into it, or cross-drive move that the OS reports as delete+create).
+        Deletes events older than retention_days from the events table.
+        Snapshots are never purged — they represent current file state.
+        Called once on every startup before the diff runs.
         """
-        if event.is_directory or not self._should_watch(event.src_path):
+        if retention_days <= 0:
             return
 
-        path = event.src_path
-        file_hash = compute_hash(path, self.hash_algorithm)
-        size, mtime = get_file_info(path)
+        cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
+        cursor = self.conn.execute(
+            "DELETE FROM events WHERE timestamp < ?", (cutoff,)
+        )
+        self.conn.commit()
 
-        with self._lock:
-            self._clean_pending_deletes()
+        if cursor.rowcount:
+            log.info("Purged %d event(s) older than %d day(s).",
+                     cursor.rowcount, retention_days)
 
-            if file_hash and file_hash in self.pending_deletes:
-                # Hash match → classify as MOVED, RENAMED, or MOVED_AND_RENAMED
-                old_path, _ = self.pending_deletes.pop(file_hash)
-                event_type = classify_path_change(old_path, path)
-                self.db.log_event(event_type, old_path, dest_path=path,
-                                  file_size=size, md5_hash=file_hash)
-                self.db.delete_snapshot(old_path)
-            else:
-                self.db.log_event("CREATED", path, file_size=size, md5_hash=file_hash)
+    # ------------------------------------------------------------------
+    # CLEANUP
+    # ------------------------------------------------------------------
 
-        if size is not None:
-            self.db.upsert_snapshot(path, size, mtime, file_hash)
-
-    def on_modified(self, event):
-        """
-        Fires when an existing file's contents or metadata change.
-        We re-hash and re-snapshot the file on every modification.
-        """
-        if event.is_directory or not self._should_watch(event.src_path):
-            return
-
-        path = event.src_path
-        file_hash = compute_hash(path, self.hash_algorithm)
-        size, mtime = get_file_info(path)
-
-        self.db.log_event("MODIFIED", path, file_size=size, md5_hash=file_hash)
-
-        if size is not None:
-            self.db.upsert_snapshot(path, size, mtime, file_hash)
-
-    def on_deleted(self, event):
-        """
-        Fires when a file disappears.
-        We DON'T log it immediately — we store the hash in pending_deletes
-        and wait move_window seconds. If a matching CREATE arrives in time,
-        on_created() will claim it as a MOVE and clear the pending entry.
-        If nothing claims it after move_window, a background thread logs
-        it as a real DELETE.
-        """
-        if event.is_directory or not self._should_watch(event.src_path):
-            return
-
-        path = event.src_path
-
-        # Retrieve the file's last known hash from the snapshot
-        snapshots = self.db.get_all_snapshots()
-        file_hash = snapshots.get(path, {}).get("md5_hash")
-
-        with self._lock:
-            if file_hash:
-                self.pending_deletes[file_hash] = (path, time.time())
-
-        # Background thread waits, then confirms delete if unclaimed
-        def delayed_delete_log():
-            time.sleep(self.move_window)
-            with self._lock:
-                if file_hash and file_hash in self.pending_deletes:
-                    self.pending_deletes.pop(file_hash, None)
-                    self.db.log_event("DELETED", path)
-                    self.db.delete_snapshot(path)
-
-        threading.Thread(target=delayed_delete_log, daemon=True).start()
-
-    def on_moved(self, event):
-        """
-        watchdog fires this when BOTH source and destination are inside
-        the watched directory — watchdog can see both sides of the move.
-        This is the clean case; no hash matching needed.
-        """
-        if event.is_directory or not self._should_watch(event.src_path):
-            return
-
-        src = event.src_path
-        dest = event.dest_path
-        file_hash = compute_hash(dest, self.hash_algorithm)
-        size, mtime = get_file_info(dest)
-
-        event_type = classify_path_change(src, dest)
-        self.db.log_event(event_type, src, dest_path=dest,
-                          file_size=size, md5_hash=file_hash)
-        self.db.delete_snapshot(src)
-
-        if size is not None:
-            self.db.upsert_snapshot(dest, size, mtime, file_hash)
+    def close(self):
+        self.conn.close()
