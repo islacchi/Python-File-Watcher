@@ -2,10 +2,12 @@
 main.py — Entry point
 Execution order on every run:
   1. Load config.ini
-  2. Open (or create) the SQLite database
-  3. Run startup diff  → detect changes that happened while the script was off
-  4. Start watchdog observer → catch live changes going forward
-  5. Stay alive until Ctrl+C or Task Scheduler kills the process
+  2. Set up logging (file + console)
+  3. Open (or create) the SQLite database
+  4. Purge events older than retention_days
+  5. Run startup diff  → detect changes that happened while the script was off
+  6. Start watchdog observer → catch live changes going forward
+  7. Stay alive, auto-reconnect if the watched drive goes offline
 """
 
 import os
@@ -15,8 +17,11 @@ import configparser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
 
+from logger import setup_logging, get_logger
 from db import Database
 from handler import FileWatchHandler, compute_hash, get_file_info, classify_path_change
+
+log = get_logger(__name__)
 
 
 # ------------------------------------------------------------------
@@ -51,16 +56,13 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
     Performance optimisations:
       1. mtime pre-filter  — if a file's size and mtime match the last snapshot,
                              reuse the stored hash instead of re-hashing the file.
-                             Skips hashing for unchanged files on repeat startups.
       2. Parallel hashing  — files that DO need hashing are processed concurrently
-                             using a thread pool, reducing total scan time on large
-                             network drives.
+                             using a thread pool.
     """
     if old_snapshot is None:
         old_snapshot = {}
 
-    # --- Phase 1: walk the directory and collect candidate file paths ---
-    candidates = []  # (path, size, mtime) for files that passed the filter
+    candidates = []
 
     walker = os.walk(watch_dir) if recursive else [
         (watch_dir, [], os.listdir(watch_dir))
@@ -79,12 +81,9 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
                 candidates.append((path, size, mtime))
 
     current = {}
-    to_hash = []   # files that need fresh hashing
-    skipped = 0    # counter for logging
+    to_hash = []
+    skipped = 0
 
-    # --- Phase 2: mtime pre-filter ---
-    # If size AND mtime match the snapshot, the file hasn't changed —
-    # reuse the stored hash without reading the file at all.
     for path, size, mtime in candidates:
         snap = old_snapshot.get(path)
         if snap and snap["size"] == size and snap["mtime"] == mtime and snap["md5_hash"]:
@@ -93,12 +92,8 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
         else:
             to_hash.append((path, size, mtime))
 
-    print(f"[STARTUP] {skipped} file(s) unchanged (skipped hashing). "
-          f"{len(to_hash)} file(s) need hashing...")
+    log.info("mtime pre-filter: %d unchanged, %d need hashing.", skipped, len(to_hash))
 
-    # --- Phase 3: parallel hashing for files that need it ---
-    # 8 threads is a reasonable ceiling for network drives;
-    # more threads won't help if the bottleneck is network bandwidth.
     if to_hash:
         max_workers = min(8, len(to_hash))
 
@@ -107,11 +102,74 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
             file_hash = compute_hash(path, hash_algorithm)
             return path, size, mtime, file_hash
 
+        def format_eta(seconds: float) -> str:
+            """Converts a raw second count into a human-readable string."""
+            if seconds < 60:
+                return f"~{int(seconds)}s"
+            elif seconds < 3600:
+                mins = int(seconds // 60)
+                secs = int(seconds % 60)
+                return f"~{mins}m {secs}s"
+            else:
+                hours = int(seconds // 3600)
+                mins  = int((seconds % 3600) // 60)
+                return f"~{hours}h {mins}m"
+
+        # --- ETA estimation ---
+        # Hash a small sample of up to 5 files first and measure how long
+        # it takes. Use that rate to estimate how long the rest will take.
+        SAMPLE_SIZE    = min(5, len(to_hash))
+        sample         = to_hash[:SAMPLE_SIZE]
+        remaining      = to_hash[SAMPLE_SIZE:]
+        sample_start   = time.time()
+        sample_results = []
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, SAMPLE_SIZE)) as executor:
+            futures = {executor.submit(hash_file, item): item for item in sample}
+            for future in as_completed(futures):
+                result = future.result()
+                sample_results.append(result)
+                current[result[0]] = {
+                    "size": result[1], "mtime": result[2], "md5_hash": result[3]
+                }
+
+        sample_elapsed   = time.time() - sample_start
+        seconds_per_file = sample_elapsed / SAMPLE_SIZE if SAMPLE_SIZE else 0
+        estimated_seconds = (seconds_per_file * len(remaining)) / max(max_workers, 1)
+
+        if remaining:
+            log.info(
+                "Sampled %d file(s) in %.1fs. "
+                "Estimated time for remaining %d file(s): %s",
+                SAMPLE_SIZE, sample_elapsed, len(remaining),
+                format_eta(estimated_seconds)
+            )
+        else:
+            log.info("All files covered in sample. Scan complete.")
+
+        # --- Hash remaining files with progress updates every 50 files ---
+        hashed_count = SAMPLE_SIZE
+        total        = len(to_hash)
+        batch_start  = time.time()
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(hash_file, item): item for item in to_hash}
+            futures = {executor.submit(hash_file, item): item for item in remaining}
             for future in as_completed(futures):
                 path, size, mtime, file_hash = future.result()
                 current[path] = {"size": size, "mtime": mtime, "md5_hash": file_hash}
+                hashed_count += 1
+
+                if hashed_count % 50 == 0 or hashed_count == total:
+                    elapsed     = time.time() - batch_start
+                    done_so_far = hashed_count - SAMPLE_SIZE
+                    if done_so_far > 0 and elapsed > 0:
+                        rate     = done_so_far / elapsed / max(max_workers, 1)
+                        left     = total - hashed_count
+                        eta_secs = (left / rate / max(max_workers, 1)) if rate > 0 else 0
+                        log.info(
+                            "Progress: %d / %d file(s) hashed. ETA: %s",
+                            hashed_count, total, format_eta(eta_secs)
+                        )
 
     return current
 
@@ -119,12 +177,6 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
 def run_startup_diff(db: Database, config: configparser.ConfigParser):
     """
     Compares the saved SQLite snapshot against the actual current directory state.
-
-    Logic:
-      - Paths in snapshot but NOT on disk       → deleted (or moved) while offline
-      - Paths on disk but NOT in snapshot        → created (or moved) while offline
-      - Paths in both but hash changed           → modified while offline
-      - Deleted path hash matches a created path → move/rename while offline
     """
     watch_dir      = config["watcher"]["watch_directory"]
     recursive      = config["watcher"].getboolean("recursive", True)
@@ -132,34 +184,29 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
     ignore_pfx     = config["filters"]["ignore_prefixes"].replace(" ", "").split(",")
     hash_algorithm = config["snapshot"]["hash_algorithm"]
 
-    print("[STARTUP] Scanning for offline changes...")
+    log.info("Scanning for offline changes...")
 
-    old_snapshot     = db.get_all_snapshots()           # what SQLite remembers
-    current_snapshot = scan_directory(                  # what's on disk right now
+    old_snapshot     = db.get_all_snapshots()
+    current_snapshot = scan_directory(
         watch_dir, watch_ext, ignore_pfx, hash_algorithm, recursive,
-        old_snapshot=old_snapshot                       # passed in for mtime pre-filter
+        old_snapshot=old_snapshot
     )
 
     old_paths     = set(old_snapshot.keys())
     current_paths = set(current_snapshot.keys())
+    missing_paths = old_paths - current_paths
+    new_paths     = current_paths - old_paths
+    common_paths  = old_paths & current_paths
 
-    missing_paths = old_paths - current_paths           # gone from disk
-    new_paths     = current_paths - old_paths           # new on disk
-    common_paths  = old_paths & current_paths           # existed before and still exist
-
-    # Build a reverse-lookup: hash → old_path for all missing files
-    # This lets us detect moves/renames: a "new" file whose hash matches
-    # a "missing" file is really the same file moved.
     deleted_by_hash = {
         old_snapshot[p]["md5_hash"]: p
         for p in missing_paths
         if old_snapshot[p]["md5_hash"]
     }
 
-    resolved_as_move_old  = set()   # old paths explained by a move
-    resolved_as_move_new  = set()   # new paths explained by a move
+    resolved_as_move_old = set()
+    resolved_as_move_new = set()
 
-    # ---- OFFLINE MOVE DETECTION ----
     for path in new_paths:
         new_hash = current_snapshot[path]["md5_hash"]
         if new_hash and new_hash in deleted_by_hash:
@@ -173,19 +220,16 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
             resolved_as_move_old.add(old_path)
             resolved_as_move_new.add(path)
 
-    # ---- OFFLINE DELETES (genuinely gone, not a move) ----
     for path in missing_paths - resolved_as_move_old:
         db.log_event("DELETED (offline)", path)
         db.delete_snapshot(path)
 
-    # ---- OFFLINE CREATES (genuinely new, not a move destination) ----
     for path in new_paths - resolved_as_move_new:
         info = current_snapshot[path]
         db.log_event("CREATED (offline)", path,
                      file_size=info["size"], md5_hash=info["md5_hash"])
         db.upsert_snapshot(path, info["size"], info["mtime"], info["md5_hash"])
 
-    # ---- OFFLINE MODIFICATIONS ----
     for path in common_paths:
         old_hash = old_snapshot[path]["md5_hash"]
         new_hash = current_snapshot[path]["md5_hash"]
@@ -204,7 +248,71 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
             if old_snapshot[p]["md5_hash"] != current_snapshot[p]["md5_hash"]
         )
     )
-    print(f"[STARTUP] Done. {total_changes} offline change(s) detected.\n")
+    log.info("Startup diff done. %d offline change(s) detected.", total_changes)
+
+
+# ------------------------------------------------------------------
+# OBSERVER MANAGEMENT — handles network drive disconnects
+# ------------------------------------------------------------------
+
+def start_observer(watch_dir: str, recursive: bool, handler: FileWatchHandler):
+    """Creates and starts a fresh watchdog Observer."""
+    observer = Observer()
+    observer.schedule(handler, watch_dir, recursive=recursive)
+    observer.start()
+    return observer
+
+
+def run_with_reconnect(watch_dir: str, recursive: bool,
+                       handler: FileWatchHandler, reconnect_delay: int = 30):
+    """
+    Keeps the watchdog Observer alive indefinitely.
+    If the watched path becomes unreachable (network drive goes offline),
+    the observer is stopped and the script waits reconnect_delay seconds
+    before trying again. Retries until the drive comes back online.
+    This prevents the script from silently dying mid-session.
+    """
+    observer = None
+
+    while True:
+        try:
+            if not os.path.exists(watch_dir):
+                log.warning(
+                    "Watch directory unreachable: %s. "
+                    "Retrying in %d seconds...", watch_dir, reconnect_delay
+                )
+                if observer and observer.is_alive():
+                    observer.stop()
+                    observer.join()
+                    observer = None
+                time.sleep(reconnect_delay)
+                continue
+
+            if observer is None:
+                observer = start_observer(watch_dir, recursive, handler)
+                log.info("Observer started. Watching: %s", watch_dir)
+
+            time.sleep(1)
+
+            # If watchdog's internal thread died unexpectedly, restart it
+            if not observer.is_alive():
+                log.error("Observer thread died unexpectedly. Restarting...")
+                observer = None
+
+        except KeyboardInterrupt:
+            log.info("Shutdown requested.")
+            break
+        except Exception as e:
+            log.error("Unexpected error in observer loop: %s", e, exc_info=True)
+            if observer and observer.is_alive():
+                observer.stop()
+                observer.join()
+            observer = None
+            time.sleep(reconnect_delay)
+
+    if observer and observer.is_alive():
+        observer.stop()
+        observer.join()
 
 
 # ------------------------------------------------------------------
@@ -212,7 +320,6 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
 # ------------------------------------------------------------------
 
 def main():
-    # Resolve config path relative to this script's location
     script_dir  = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.ini")
 
@@ -221,42 +328,46 @@ def main():
     log_dir   = config["storage"]["log_directory"]
     db_name   = config["storage"]["db_name"]
     recursive = config["watcher"].getboolean("recursive", True)
+    retention = config["storage"].getint("retention_days", 90)
+    reconnect_delay = config["watcher"].getint("reconnect_delay", 30)
 
-    # Validate watch directory
-    if not os.path.isdir(watch_dir):
-        print(f"[ERROR] watch_directory does not exist: {watch_dir}")
-        sys.exit(1)
-
-    # Create log directory if it doesn't exist
+    # Step 1: set up logging before anything else so all messages are captured
     os.makedirs(log_dir, exist_ok=True)
+    setup_logging(log_dir)
 
-    # Open database (creates file if new)
+    log.info("=" * 60)
+    log.info("File Watcher starting up.")
+    log.info("Watch directory : %s", watch_dir)
+    log.info("Log directory   : %s", log_dir)
+    log.info("Retention       : %d day(s)", retention)
+
+    # Step 2: wait for the watch directory to be available before proceeding
+    # This handles the case where the script starts before the network drive mounts
+    if not os.path.isdir(watch_dir):
+        log.warning("Watch directory not available yet: %s", watch_dir)
+        log.warning("Waiting for it to become available...")
+        while not os.path.isdir(watch_dir):
+            time.sleep(reconnect_delay)
+        log.info("Watch directory is now available.")
+
+    # Step 3: open database
     db_path = os.path.join(log_dir, db_name)
     db      = Database(db_path)
 
-    # Phase 1: detect offline changes before starting live watcher
+    # Step 4: purge old events
+    db.purge_old_events(retention)
+
+    # Step 5: detect offline changes
     run_startup_diff(db, config)
 
-    # Phase 2: start live watchdog observer
-    handler  = FileWatchHandler(db, config)
-    observer = Observer()
-    observer.schedule(handler, watch_dir, recursive=recursive)
-    observer.start()
+    # Step 6: start live watcher with reconnect support
+    handler = FileWatchHandler(db, config)
+    log.info("Live watcher active. Press Ctrl+C to stop.")
 
-    print(f"[LIVE] Watching : {watch_dir}")
-    print(f"[LIVE] Log DB   : {db_path}")
-    print("[LIVE] Press Ctrl+C to stop.\n")
+    run_with_reconnect(watch_dir, recursive, handler, reconnect_delay)
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[STOPPING] Shutting down file watcher...")
-        observer.stop()
-
-    observer.join()
     db.close()
-    print("[STOPPED]")
+    log.info("File Watcher stopped.")
 
 
 if __name__ == "__main__":
