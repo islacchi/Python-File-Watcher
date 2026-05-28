@@ -6,7 +6,10 @@ Handles all SQLite operations for two purposes:
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 class Database:
@@ -108,7 +111,7 @@ class Database:
         md5_hash: str = None,
     ):
         """
-        Appends one row to the events table and prints it to the console.
+        Appends one row to the events table and writes to the logger.
         dest_path is only used for MOVED/RENAMED events.
         """
         timestamp = datetime.now().isoformat()
@@ -118,11 +121,33 @@ class Database:
         """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash))
         self.conn.commit()
 
-        # Console output for visibility
         if dest_path:
-            print(f"[{timestamp}] {event_type}: {src_path}  →  {dest_path}")
+            log.info("%s: %s  →  %s", event_type, src_path, dest_path)
         else:
-            print(f"[{timestamp}] {event_type}: {src_path}")
+            log.info("%s: %s", event_type, src_path)
+
+    # ------------------------------------------------------------------
+    # RETENTION / CLEANUP
+    # ------------------------------------------------------------------
+
+    def purge_old_events(self, retention_days: int):
+        """
+        Deletes events older than retention_days from the events table.
+        Snapshots are never purged — they represent current file state.
+        Called once on every startup before the diff runs.
+        """
+        if retention_days <= 0:
+            return
+
+        cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
+        cursor = self.conn.execute(
+            "DELETE FROM events WHERE timestamp < ?", (cutoff,)
+        )
+        self.conn.commit()
+
+        if cursor.rowcount:
+            log.info("Purged %d event(s) older than %d day(s).",
+                     cursor.rowcount, retention_days)
 
     # ------------------------------------------------------------------
     # CLEANUP
