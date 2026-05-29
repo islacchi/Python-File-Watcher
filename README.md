@@ -72,6 +72,7 @@ All settings live in `config.ini`. No code changes needed.
 | `watch_directory` | `[watcher]` | — | Full path to the directory to monitor |
 | `recursive` | `[watcher]` | `true` | Watch subdirectories recursively |
 | `reconnect_delay` | `[watcher]` | `30` | Seconds to wait before retrying if drive goes offline |
+| `move_window` | `[watcher]` | `10` | Seconds to poll for a matching file after DELETE before confirming it as a delete |
 | `watch_extensions` | `[filters]` | see file | Whitelist of file extensions to track |
 | `ignore_prefixes` | `[filters]` | `~$, .~, ~` | Filename prefixes to ignore (Office lock files) |
 | `log_directory` | `[storage]` | — | Where to save `filelog.db` and `filewatcher.log` |
@@ -134,7 +135,8 @@ for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50")
 | src_path   | File path where the event occurred (source path for renames/moves)  |
 | dest_path  | Destination path — populated for RENAMED, MOVED, MOVED_AND_RENAMED  |
 | file_size  | Size in bytes at time of event                                      |
-| md5_hash   | MD5 fingerprint of file contents                                    |
+| md5_hash   | MD5 fingerprint of file contents after the event                    |
+| prev_hash  | MD5 fingerprint before the change — populated for MODIFIED events only |
 
 ### Event types
 | Event type                    | Meaning                                              |
@@ -226,8 +228,9 @@ File system event fires  [handler.py] → on_created / on_modified
 Extension + prefix filter             → skip ~$ prefixes, check whitelist
       │
       ▼
-Classify event           [handler.py] → DELETED waits 2s pending buffer
-      │                               → hash match → RENAMED / MOVED
+Classify event           [handler.py] → DELETED polls every 1s up to move_window
+      │                               → hash match found → RENAMED / MOVED
+      │                               → window expires → confirmed DELETE
       ▼
 Log live event           [db.py]      → db.log_event() + upsert_snapshot()
       │
@@ -245,7 +248,7 @@ python query.py          [query.py]   → reads filelog.db directly
 
 - **First run on large drives is slow** — every matching file must be MD5 hashed to build the initial snapshot. On a network drive with thousands of files this can take several minutes. Every run after the first is fast due to the mtime pre-filter.
 
-- **Move detection has a 2-second window** — when a file is deleted and recreated (cross-folder move), the script waits 2 seconds to match the hashes. If the new file appears after 2 seconds, the event is logged as a DELETE + CREATE instead of a MOVE. This window is intentionally short to keep live logging responsive.
+- **Move detection window** — when a file is deleted and recreated (cross-folder move), the script polls the watch directory every second for up to `move_window` seconds looking for a file with a matching hash. The MOVED event is logged the moment the file finishes copying — not after a blind wait. If no match is found within the window, it is confirmed as a DELETE. Increase `move_window` in `config.ini` if large files on slow network drives are still being logged as DELETE + CREATE instead of MOVED.
 
 - **Network drive hashing is slower than local** — MD5 hashing over a network connection is limited by network bandwidth, not disk speed. Pointing `watch_directory` to a specific subfolder rather than the drive root significantly reduces startup time.
 
