@@ -23,6 +23,8 @@ from handler import FileWatchHandler, compute_hash, get_file_info, classify_path
 
 log = get_logger(__name__)
 
+SCRIPT_VERSION = "1.0.0"
+
 
 # ------------------------------------------------------------------
 # CONFIG
@@ -354,7 +356,15 @@ def main():
     db_path = os.path.join(log_dir, db_name)
     db      = Database(db_path)
 
-    # Step 4: purge old events
+    # Step 4: write script metadata to config table for the Laravel UI
+    db.upsert_config("watch_directory", watch_dir)
+    db.upsert_config("log_directory",   log_dir)
+    db.upsert_config("retention_days",  str(retention))
+    db.upsert_config("script_version",  SCRIPT_VERSION)
+    db.upsert_config("started_at",      __import__("datetime").datetime.now().isoformat())
+    log.info("Config table updated.")
+
+    # Step 5: purge old events
     db.purge_old_events(retention)
 
     # Step 5: detect offline changes

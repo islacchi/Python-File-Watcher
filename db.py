@@ -1,8 +1,9 @@
 """
 db.py — Database layer
-Handles all SQLite operations for two purposes:
+Handles all SQLite operations for three purposes:
   1. snapshots table  → stores the last known state of every watched file
   2. events table     → stores a permanent log of every change detected
+  3. config table     → stores script metadata readable by the Laravel UI
 """
 
 import sqlite3
@@ -53,6 +54,15 @@ class Database:
                 md5_hash    TEXT,
                 prev_hash   TEXT
             );
+
+            -- config table: stores script metadata readable by the Laravel UI
+            -- One row per key, upserted on every startup
+            CREATE TABLE IF NOT EXISTS config (
+                key         TEXT UNIQUE NOT NULL,
+                value       TEXT,
+                updated     TEXT
+            );
+
             -- Add prev_hash to existing databases that predate this column
             -- This is a no-op if the column already exists
             PRAGMA legacy_alter_table = ON;
@@ -185,6 +195,37 @@ class Database:
         if cursor.rowcount:
             log.info("Purged %d event(s) older than %d day(s).",
                      cursor.rowcount, retention_days)
+
+    # ------------------------------------------------------------------
+    # CONFIG TABLE OPERATIONS
+    # ------------------------------------------------------------------
+
+    def upsert_config(self, key: str, value: str):
+        """
+        Inserts or updates a single row in the config table.
+        Called on every startup to keep the UI informed of the current
+        script state — watch directory, start time, retention setting, etc.
+        """
+        now = datetime.now().isoformat()
+        self.conn.execute("""
+            INSERT INTO config (key, value, updated)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value   = excluded.value,
+                updated = excluded.updated
+        """, (key, value, now))
+        self.conn.commit()
+
+    def get_config(self, key: str) -> str | None:
+        """
+        Returns the value for a given config key.
+        Returns None if the key does not exist.
+        """
+        cursor = self.conn.execute(
+            "SELECT value FROM config WHERE key = ?", (key,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     # ------------------------------------------------------------------
     # CLEANUP
