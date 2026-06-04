@@ -8,7 +8,6 @@ Monitors a directory for changes to Excel, Word, PDF, and image files.
 Logs all events (create, modify, delete, rename, move) to a SQLite database.
 Detects changes that occurred while the script was not running on every restart.
 Auto-recovers if the watched drive goes offline.
-Exposes script metadata via a `config` table readable by an external Laravel UI.
 
 ---
 
@@ -87,7 +86,7 @@ All settings live in `config.ini`. No code changes needed.
 
 Two log outputs are written to `log_directory` on every run:
 
-- **`filelog.db`** — SQLite database containing all file change events, the current snapshot, and script metadata
+- **`filelog.db`** — SQLite database containing all file change events and the current snapshot
 - **`filewatcher.log`** — rotating text log of all script activity including startup, errors, and reconnects. Rotates at 5MB, keeps last 5 files.
 
 ---
@@ -112,8 +111,8 @@ Filters stack — `--type DELETED --today` shows only today's deletes.
 ### Option 2 — DB Browser for SQLite (visual)
 
 Download free from https://sqlitebrowser.org. Open `filelog.db` from your
-`log_directory`, click the **Browse Data** tab, and select any table from
-the dropdown: `events`, `snapshots`, or `config`.
+`log_directory`, click the **Browse Data** tab, and select the `events` or
+`snapshots` table from the dropdown.
 
 ### Option 3 — Python directly
 
@@ -126,11 +125,9 @@ for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50")
 
 ---
 
-## Database Structure
+## Events Table Reference
 
-`filelog.db` contains three tables:
-
-### events table
+### Columns
 | Column     | Description                                                         |
 |------------|---------------------------------------------------------------------|
 | timestamp  | ISO 8601 datetime of the event                                      |
@@ -141,31 +138,7 @@ for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50")
 | md5_hash   | MD5 fingerprint of file contents after the event                    |
 | prev_hash  | MD5 fingerprint before the change — populated for MODIFIED events only |
 
-### snapshots table
-| Column     | Description                                                         |
-|------------|---------------------------------------------------------------------|
-| path       | Current file path (unique per file)                                 |
-| size       | File size in bytes                                                  |
-| mtime      | Unix timestamp of last modification                                 |
-| md5_hash   | MD5 fingerprint of current file contents                            |
-| last_seen  | ISO 8601 datetime the file was last observed                        |
-
-### config table
-Stores script metadata written on every startup. Queryable by an external
-Laravel UI or any other tool reading the database.
-
-| key               | example value                        | description                          |
-|-------------------|--------------------------------------|--------------------------------------|
-| `watch_directory` | `K:\`                                | Directory currently being monitored  |
-| `log_directory`   | `C:\Users\primelink\Desktop\LOGS`    | Where logs and the database are saved|
-| `retention_days`  | `90`                                 | Current retention setting            |
-| `script_version`  | `1.0.0`                              | Version of the running script        |
-| `started_at`      | `2026-05-26T14:58:00`                | When the script last started         |
-
----
-
-## Event Types
-
+### Event types
 | Event type                    | Meaning                                              |
 |-------------------------------|------------------------------------------------------|
 | `CREATED`                     | A new file appeared in the watched directory         |
@@ -181,9 +154,7 @@ Laravel UI or any other tool reading the database.
 | `MOVED (offline)`             | File was moved while the script was not running      |
 | `MOVED_AND_RENAMED (offline)` | File was moved and renamed while script was off      |
 
----
-
-## Useful SQL Queries
+### Useful SQL queries
 
 **See only deleted files:**
 ```sql
@@ -210,11 +181,6 @@ SELECT * FROM events WHERE src_path LIKE '%filename.pdf%'
 SELECT * FROM events WHERE timestamp LIKE '2026-05-26%'
 ```
 
-**Read the config table:**
-```sql
-SELECT * FROM config
-```
-
 ---
 
 ## Architecture
@@ -234,9 +200,6 @@ Watch dir available?     [main.py]    → waits if K:\ not mounted yet
       ▼
 Open / create database   [db.py]      → filelog.db, creates tables
       │
-      ▼
-Write config metadata    [db.py]      → watch_directory, started_at,
-      │                                 retention_days, script_version
       ▼
 Purge old events         [db.py]      → deletes rows older than retention_days
       │
@@ -277,36 +240,7 @@ Log live event           [db.py]      → db.log_event() + upsert_snapshot()
 
 python query.py          [query.py]   → reads filelog.db directly
                                       → filter by type, file, date
-
-── LARAVEL UI (separate project) ────────────────────────────────
-
-filelog.db               ← shared database file
-      │
-      ├── events table     → event log, filterable by type/date/file
-      ├── snapshots table  → current state of all tracked files
-      └── config table     → watch_directory, started_at, script_version
 ```
-
----
-
-## Laravel UI Integration
-
-The database is designed to be read by an external Laravel UI running on
-the same machine. No API layer is needed — Laravel connects directly to
-`filelog.db` via SQLite.
-
-In your Laravel `.env`:
-```env
-DB_CONNECTION=sqlite
-DB_DATABASE=C:\Users\primelink\Desktop\LOGS\filelog.db
-```
-
-WAL mode is already enabled on the database, allowing Laravel to read
-while the Python script is actively writing without lock conflicts.
-
-The `config` table is the primary integration point — it tells the UI
-which directory is being watched, when the script last started, and what
-retention setting is active.
 
 ---
 
