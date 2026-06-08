@@ -265,6 +265,36 @@ def start_observer(watch_dir: str, recursive: bool, handler: FileWatchHandler):
     return observer
 
 
+def start_heartbeat(db: Database, interval: int = 30):
+    """
+    Spawns a daemon thread that upserts a heartbeat timestamp to the
+    config table every `interval` seconds while the script is alive.
+
+    The Laravel UI reads this value to determine whether the script is
+    currently running. Without this, the UI would show the script as
+    offline during periods of no file activity since no events are written.
+
+    The thread is a daemon — it dies automatically when main.py exits,
+    so no manual cleanup is needed.
+    """
+    import threading
+
+    def _beat():
+        while True:
+            try:
+                db.upsert_config(
+                    "heartbeat",
+                    __import__("datetime").datetime.now().isoformat()
+                )
+            except Exception as e:
+                log.warning("Heartbeat write failed: %s", e)
+            time.sleep(interval)
+
+    thread = threading.Thread(target=_beat, daemon=True)
+    thread.start()
+    log.info("Heartbeat started (every %ds).", interval)
+
+
 def run_with_reconnect(watch_dir: str, recursive: bool,
                        handler: FileWatchHandler, reconnect_delay: int = 30):
     """
@@ -332,6 +362,7 @@ def main():
     recursive = config["watcher"].getboolean("recursive", True)
     retention = config["storage"].getint("retention_days", 90)
     reconnect_delay = config["watcher"].getint("reconnect_delay", 30)
+    heartbeat_interval = config["watcher"].getint("heartbeat_interval", 30)
 
     # Step 1: set up logging before anything else so all messages are captured
     os.makedirs(log_dir, exist_ok=True)
@@ -370,7 +401,10 @@ def main():
     # Step 5: detect offline changes
     run_startup_diff(db, config)
 
-    # Step 6: start live watcher with reconnect support
+    # Step 6: start heartbeat so the Laravel UI knows the script is alive
+    start_heartbeat(db, heartbeat_interval)
+
+    # Step 7: start live watcher with reconnect support
     handler = FileWatchHandler(db, config)
     log.info("Live watcher active. Press Ctrl+C to stop.")
 
