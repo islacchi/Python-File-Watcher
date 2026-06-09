@@ -4,10 +4,17 @@ Handles all SQLite operations for three purposes:
   1. snapshots table  → stores the last known state of every watched file
   2. events table     → stores a permanent log of every change detected
   3. config table     → stores script metadata readable by the Laravel UI
+
+Performance optimisations:
+  - WAL journal mode for concurrent read/write
+  - synchronous=NORMAL (faster writes, WAL protects durability)
+  - Automatic batched commits — default flush every 50 writes or 1 second
+  - Index on events.timestamp for fast purge queries
 """
 
 import sqlite3
 from datetime import datetime, timedelta
+import threading
 from logger import get_logger
 
 log = get_logger(__name__)
@@ -22,8 +29,20 @@ class Database:
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+
+        # Performance: WAL mode + relaxed sync for ~2-5x faster writes
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+
         self._create_tables()
         self._migrate()
+
+        # Batched commit state
+        self._write_count = 0
+        self._flush_lock = threading.Lock()
+        self._flush_interval = 50       # flush every N writes
+        self._flush_timer: threading.Timer | None = None
+        self._flush_timer_interval = 1.0  # also flush every 1 second
 
     # ------------------------------------------------------------------
     # SETUP
@@ -54,6 +73,10 @@ class Database:
                 md5_hash    TEXT,
                 prev_hash   TEXT
             );
+
+            -- Fast lookup for purge_old_events()
+            CREATE INDEX IF NOT EXISTS idx_events_timestamp
+                ON events(timestamp);
 
             -- config table: stores script metadata readable by the Laravel UI
             -- One row per key, upserted on every startup
@@ -87,6 +110,90 @@ class Database:
             log.info("Migrated events table: added prev_hash column.")
 
     # ------------------------------------------------------------------
+    # BATCHED COMMIT
+    # ------------------------------------------------------------------
+
+    def _maybe_flush(self):
+        """Commit if we've accumulated enough writes since last flush."""
+        with self._flush_lock:
+            self._write_count += 1
+            if self._write_count >= self._flush_interval:
+                self._write_count = 0
+                self.conn.commit()
+
+    def _start_timer(self):
+        """Start a background timer that flushes every 1 second."""
+        if self._flush_timer is not None:
+            self._flush_timer.cancel()
+        self._flush_timer = threading.Timer(
+            self._flush_timer_interval, self._timed_flush
+        )
+        self._flush_timer.daemon = True
+        self._flush_timer.start()
+
+    def _timed_flush(self):
+        """Called by the timer thread — commits pending writes."""
+        with self._flush_lock:
+            if self._write_count > 0:
+                self._write_count = 0
+                self.conn.commit()
+        self._start_timer()
+
+    def _mark_dirty(self):
+        """Call after every INSERT/UPDATE/DELETE to trigger batched commits."""
+        self._maybe_flush()
+        # Lazily start the timer on first write
+        if self._flush_timer is None:
+            self._start_timer()
+
+    def flush(self):
+        """Force an immediate commit. Call before shutdown or during idle."""
+        with self._flush_lock:
+            if self._write_count > 0:
+                self._write_count = 0
+                self.conn.commit()
+        if self._flush_timer is not None:
+            self._flush_timer.cancel()
+            self._flush_timer = None
+
+    # ------------------------------------------------------------------
+    # BATCH EVENT INSERT
+    # ------------------------------------------------------------------
+
+    def log_events_batch(self, events: list):
+        """
+        Inserts multiple events in a single executemany() call.
+        Much faster than calling log_event() in a loop for bulk operations
+        (startup diff, initial scan, etc.).
+
+        Each event is a dict with keys:
+          event_type, src_path, dest_path, file_size, md5_hash, prev_hash
+        """
+        if not events:
+            return
+
+        now = datetime.now().isoformat()
+        rows = [
+            (
+                now,
+                e.get("event_type"),
+                e.get("src_path"),
+                e.get("dest_path"),
+                e.get("file_size"),
+                e.get("md5_hash"),
+                e.get("prev_hash"),
+            )
+            for e in events
+        ]
+
+        self.conn.executemany("""
+            INSERT INTO events (timestamp, event_type, src_path, dest_path,
+                                file_size, md5_hash, prev_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
     # SNAPSHOT OPERATIONS
     # ------------------------------------------------------------------
 
@@ -118,6 +225,26 @@ class Database:
                 md5_hash  = excluded.md5_hash,
                 last_seen = excluded.last_seen
         """, (path, size, mtime, md5_hash, now))
+        self._mark_dirty()
+
+    def upsert_snapshots_batch(self, snapshots: list):
+        """
+        Insert or update multiple snapshots in a single batch.
+        Each item is a tuple (path, size, mtime, md5_hash).
+        """
+        if not snapshots:
+            return
+
+        now = datetime.now().isoformat()
+        self.conn.executemany("""
+            INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                size      = excluded.size,
+                mtime     = excluded.mtime,
+                md5_hash  = excluded.md5_hash,
+                last_seen = excluded.last_seen
+        """, [(p, s, m, h, now) for p, s, m, h in snapshots])
         self.conn.commit()
 
     def delete_snapshot(self, path: str):
@@ -126,6 +253,18 @@ class Database:
         Called when a file is confirmed deleted or moved away from its old path.
         """
         self.conn.execute("DELETE FROM snapshots WHERE path = ?", (path,))
+        self._mark_dirty()
+
+    def delete_snapshots_batch(self, paths: list):
+        """
+        Delete multiple snapshots in a single batch.
+        """
+        if not paths:
+            return
+        self.conn.executemany(
+            "DELETE FROM snapshots WHERE path = ?",
+            [(p,) for p in paths]
+        )
         self.conn.commit()
 
     def get_all_snapshots(self) -> dict:
@@ -160,13 +299,18 @@ class Database:
         dest_path is only used for MOVED/RENAMED events.
         prev_hash is the hash of the file before a MODIFIED event — allows
         before/after comparison without storing file contents.
+
+        Writes are batched — commit happens after N writes or 1 second,
+        whichever comes first.
         """
         timestamp = datetime.now().isoformat()
         self.conn.execute("""
-            INSERT INTO events (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash)
+            INSERT INTO events (timestamp, event_type, src_path, dest_path,
+                                file_size, md5_hash, prev_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash))
-        self.conn.commit()
+        """, (timestamp, event_type, src_path, dest_path,
+              file_size, md5_hash, prev_hash))
+        self._mark_dirty()
 
         if dest_path:
             log.info("%s: %s  →  %s", event_type, src_path, dest_path)
@@ -182,6 +326,7 @@ class Database:
         Deletes events older than retention_days from the events table.
         Snapshots are never purged — they represent current file state.
         Called once on every startup before the diff runs.
+        Uses the idx_events_timestamp index for fast deletion.
         """
         if retention_days <= 0:
             return
@@ -214,7 +359,7 @@ class Database:
                 value   = excluded.value,
                 updated = excluded.updated
         """, (key, value, now))
-        self.conn.commit()
+        self.conn.commit()  # config writes are rare — commit immediately
 
     def get_config(self, key: str) -> str | None:
         """
@@ -232,4 +377,5 @@ class Database:
     # ------------------------------------------------------------------
 
     def close(self):
+        self.flush()
         self.conn.close()

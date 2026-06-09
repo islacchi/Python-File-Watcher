@@ -8,11 +8,21 @@ Execution order on every run:
   5. Run startup diff  → detect changes that happened while the script was off
   6. Start watchdog observer → catch live changes going forward
   7. Stay alive, auto-reconnect if the watched drive goes offline
+
+Usage:
+    python main.py              # normal mode (daemon)
+    python main.py --once       # scan once, print results, exit (no observer)
+
+Performance optimisations:
+  - Parallel hashing with progress, no wasteful sampling phase
+  - mtime pre-filter avoids re-hashing unchanged files
+  - SIGTERM handler for clean shutdown when run as a service
 """
 
 import os
 import sys
 import time
+import signal
 import configparser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
@@ -24,6 +34,18 @@ from handler import FileWatchHandler, compute_hash, get_file_info, classify_path
 log = get_logger(__name__)
 
 SCRIPT_VERSION = "1.0.0"
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+
+def handle_signal(signum, frame):
+    """Handles SIGTERM (and others) for clean shutdown."""
+    global _shutdown_requested
+    if _shutdown_requested:
+        return  # already shutting down, ignore duplicate signals
+    _shutdown_requested = True
+    log.info("Received signal %d. Shutting down...", signum)
 
 
 # ------------------------------------------------------------------
@@ -50,6 +72,7 @@ def load_config(config_path: str = "config.ini") -> configparser.ConfigParser:
 
 def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
                    hash_algorithm: str, recursive: bool,
+                   exclude_dirs: set = None,
                    old_snapshot: dict = None) -> dict:
     """
     Walks the watch_directory right now and returns its current state as:
@@ -57,12 +80,16 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
 
     Performance optimisations:
       1. mtime pre-filter  — if a file's size and mtime match the last snapshot,
-                             reuse the stored hash instead of re-hashing the file.
+                              reuse the stored hash instead of re-hashing the file.
       2. Parallel hashing  — files that DO need hashing are processed concurrently
-                             using a thread pool.
+                              using a thread pool (no wasteful sampling phase).
+      3. Exclude dirs      — skips directories matching exclude_dirs patterns.
     """
     if old_snapshot is None:
         old_snapshot = {}
+
+    if exclude_dirs is None:
+        exclude_dirs = set()
 
     candidates = []
 
@@ -70,7 +97,12 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
         (watch_dir, [], os.listdir(watch_dir))
     ]
 
-    for root, _dirs, files in walker:
+    for root, dirs, files in walker:
+        # Filter out excluded directories in-place so os.walk skips them
+        if exclude_dirs:
+            dirs[:] = [d for d in dirs if d not in exclude_dirs
+                       and os.path.join(root, d) not in exclude_dirs]
+
         for filename in files:
             if any(prefix and filename.startswith(prefix) for prefix in ignore_prefixes):
                 continue
@@ -117,56 +149,22 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
                 mins  = int((seconds % 3600) // 60)
                 return f"~{hours}h {mins}m"
 
-        # --- ETA estimation ---
-        # Hash a small sample of up to 5 files first and measure how long
-        # it takes. Use that rate to estimate how long the rest will take.
-        SAMPLE_SIZE    = min(5, len(to_hash))
-        sample         = to_hash[:SAMPLE_SIZE]
-        remaining      = to_hash[SAMPLE_SIZE:]
-        sample_start   = time.time()
-        sample_results = []
-
-        with ThreadPoolExecutor(max_workers=min(max_workers, SAMPLE_SIZE)) as executor:
-            futures = {executor.submit(hash_file, item): item for item in sample}
-            for future in as_completed(futures):
-                result = future.result()
-                sample_results.append(result)
-                current[result[0]] = {
-                    "size": result[1], "mtime": result[2], "md5_hash": result[3]
-                }
-
-        sample_elapsed   = time.time() - sample_start
-        seconds_per_file = sample_elapsed / SAMPLE_SIZE if SAMPLE_SIZE else 0
-        estimated_seconds = (seconds_per_file * len(remaining)) / max(max_workers, 1)
-
-        if remaining:
-            log.info(
-                "Sampled %d file(s) in %.1fs. "
-                "Estimated time for remaining %d file(s): %s",
-                SAMPLE_SIZE, sample_elapsed, len(remaining),
-                format_eta(estimated_seconds)
-            )
-        else:
-            log.info("All files covered in sample. Scan complete.")
-
-        # --- Hash remaining files with progress updates every 50 files ---
-        hashed_count = SAMPLE_SIZE
         total        = len(to_hash)
+        hashed_count = 0
         batch_start  = time.time()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(hash_file, item): item for item in remaining}
+            futures = {executor.submit(hash_file, item): item for item in to_hash}
             for future in as_completed(futures):
                 path, size, mtime, file_hash = future.result()
                 current[path] = {"size": size, "mtime": mtime, "md5_hash": file_hash}
                 hashed_count += 1
 
                 if hashed_count % 50 == 0 or hashed_count == total:
-                    elapsed     = time.time() - batch_start
-                    done_so_far = hashed_count - SAMPLE_SIZE
-                    if done_so_far > 0 and elapsed > 0:
-                        rate     = done_so_far / elapsed / max(max_workers, 1)
-                        left     = total - hashed_count
+                    elapsed = time.time() - batch_start
+                    if elapsed > 0:
+                        rate    = hashed_count / elapsed / max(max_workers, 1)
+                        left    = total - hashed_count
                         eta_secs = (left / rate / max(max_workers, 1)) if rate > 0 else 0
                         log.info(
                             "Progress: %d / %d file(s) hashed. ETA: %s",
@@ -179,6 +177,7 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
 def run_startup_diff(db: Database, config: configparser.ConfigParser):
     """
     Compares the saved SQLite snapshot against the actual current directory state.
+    Uses batch database operations for better performance.
     """
     watch_dir      = config["watcher"]["watch_directory"]
     recursive      = config["watcher"].getboolean("recursive", True)
@@ -186,12 +185,20 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
     ignore_pfx     = config["filters"]["ignore_prefixes"].replace(" ", "").split(",")
     hash_algorithm = config["snapshot"]["hash_algorithm"]
 
+    # Parse optional exclude_directories filter
+    exclude_dirs_raw = config["filters"].get("exclude_directories", "").strip()
+    exclude_dirs = set()
+    if exclude_dirs_raw:
+        exclude_dirs = set(
+            d.strip() for d in exclude_dirs_raw.replace(" ", "").split(",") if d.strip()
+        )
+
     log.info("Scanning for offline changes...")
 
     old_snapshot     = db.get_all_snapshots()
     current_snapshot = scan_directory(
         watch_dir, watch_ext, ignore_pfx, hash_algorithm, recursive,
-        old_snapshot=old_snapshot
+        exclude_dirs=exclude_dirs, old_snapshot=old_snapshot
     )
 
     old_paths     = set(old_snapshot.keys())
@@ -252,6 +259,8 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
     )
     log.info("Startup diff done. %d offline change(s) detected.", total_changes)
 
+    return total_changes
+
 
 # ------------------------------------------------------------------
 # OBSERVER MANAGEMENT — handles network drive disconnects
@@ -280,7 +289,7 @@ def start_heartbeat(db: Database, interval: int = 30):
     import threading
 
     def _beat():
-        while True:
+        while not _shutdown_requested:
             try:
                 db.upsert_config(
                     "heartbeat",
@@ -303,10 +312,12 @@ def run_with_reconnect(watch_dir: str, recursive: bool,
     the observer is stopped and the script waits reconnect_delay seconds
     before trying again. Retries until the drive comes back online.
     This prevents the script from silently dying mid-session.
+    Respects the global _shutdown_requested flag.
     """
+    global _shutdown_requested
     observer = None
 
-    while True:
+    while not _shutdown_requested:
         try:
             if not os.path.exists(watch_dir):
                 log.warning(
@@ -317,30 +328,38 @@ def run_with_reconnect(watch_dir: str, recursive: bool,
                     observer.stop()
                     observer.join()
                     observer = None
-                time.sleep(reconnect_delay)
+                # Sleep in short increments so signal can interrupt
+                for _ in range(reconnect_delay):
+                    if _shutdown_requested:
+                        break
+                    time.sleep(1)
                 continue
 
             if observer is None:
                 observer = start_observer(watch_dir, recursive, handler)
                 log.info("Observer started. Watching: %s", watch_dir)
 
-            time.sleep(1)
+            # Sleep in short increments to allow signal interrupt
+            for _ in range(60):
+                if _shutdown_requested:
+                    break
+                time.sleep(1)
 
             # If watchdog's internal thread died unexpectedly, restart it
-            if not observer.is_alive():
+            if observer and not observer.is_alive():
                 log.error("Observer thread died unexpectedly. Restarting...")
                 observer = None
 
-        except KeyboardInterrupt:
-            log.info("Shutdown requested.")
-            break
         except Exception as e:
             log.error("Unexpected error in observer loop: %s", e, exc_info=True)
             if observer and observer.is_alive():
                 observer.stop()
                 observer.join()
             observer = None
-            time.sleep(reconnect_delay)
+            for _ in range(reconnect_delay):
+                if _shutdown_requested:
+                    break
+                time.sleep(1)
 
     if observer and observer.is_alive():
         observer.stop()
@@ -352,6 +371,21 @@ def run_with_reconnect(watch_dir: str, recursive: bool,
 # ------------------------------------------------------------------
 
 def main():
+    global _shutdown_requested
+    _shutdown_requested = False
+
+    # Parse CLI arguments
+    once_mode = "--once" in sys.argv
+
+    # Register signal handlers for clean shutdown
+    signal.signal(signal.SIGTERM, handle_signal)
+    # SIGINT (Ctrl+C) is already handled by KeyboardInterrupt,
+    # but we register it too for consistency
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+    except ValueError:
+        pass  # SIGINT handler may not be changeable on all platforms
+
     script_dir  = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "config.ini")
 
@@ -379,8 +413,10 @@ def main():
     if not os.path.isdir(watch_dir):
         log.warning("Watch directory not available yet: %s", watch_dir)
         log.warning("Waiting for it to become available...")
-        while not os.path.isdir(watch_dir):
+        while not os.path.isdir(watch_dir) and not _shutdown_requested:
             time.sleep(reconnect_delay)
+        if _shutdown_requested:
+            return
         log.info("Watch directory is now available.")
 
     # Step 3: open database
@@ -399,7 +435,13 @@ def main():
     db.purge_old_events(retention)
 
     # Step 5: detect offline changes
-    run_startup_diff(db, config)
+    total_changes = run_startup_diff(db, config)
+
+    # If --once mode, print summary and exit
+    if once_mode:
+        print(f"\nStartup scan complete. {total_changes} change(s) detected.\n")
+        db.close()
+        return
 
     # Step 6: start heartbeat so the Laravel UI knows the script is alive
     start_heartbeat(db, heartbeat_interval)
