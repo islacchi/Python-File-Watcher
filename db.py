@@ -10,6 +10,12 @@ Performance optimisations:
   - synchronous=NORMAL (faster writes, WAL protects durability)
   - Automatic batched commits — default flush every 50 writes or 1 second
   - Index on events.timestamp for fast purge queries
+
+Path normalization:
+  - All paths are stored and looked up as lowercase strings
+  - Prevents false-positive DELETED (offline) events caused by case
+    differences between os.walk() output and stored snapshot paths
+    (common on Windows network drives where path case is inconsistent)
 """
 
 import sqlite3
@@ -18,6 +24,16 @@ import threading
 from logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _normalize(path: str) -> str:
+    """
+    Normalizes a file path to lowercase for case-insensitive comparison.
+    Called on every path before any read or write operation so that
+    os.walk() output and stored snapshot paths always compare equal
+    regardless of drive or OS-level casing differences.
+    """
+    return path.lower() if path else path
 
 
 class Database:
@@ -177,8 +193,8 @@ class Database:
             (
                 now,
                 e.get("event_type"),
-                e.get("src_path"),
-                e.get("dest_path"),
+                _normalize(e.get("src_path")),
+                _normalize(e.get("dest_path")),
                 e.get("file_size"),
                 e.get("md5_hash"),
                 e.get("prev_hash"),
@@ -204,7 +220,7 @@ class Database:
         Returns None if the file is not in the snapshot yet.
         """
         cursor = self.conn.execute(
-            "SELECT md5_hash FROM snapshots WHERE path = ?", (path,)
+            "SELECT md5_hash FROM snapshots WHERE path = ?", (_normalize(path),)
         )
         row = cursor.fetchone()
         return row[0] if row else None
@@ -214,6 +230,7 @@ class Database:
         INSERT or UPDATE a file's record in the snapshot table.
         ON CONFLICT(path) means: if this path already exists, update it.
         This keeps only the LATEST known state per file path.
+        Path is normalized to lowercase before storage.
         """
         now = datetime.now().isoformat()
         self.conn.execute("""
@@ -224,13 +241,14 @@ class Database:
                 mtime     = excluded.mtime,
                 md5_hash  = excluded.md5_hash,
                 last_seen = excluded.last_seen
-        """, (path, size, mtime, md5_hash, now))
+        """, (_normalize(path), size, mtime, md5_hash, now))
         self._mark_dirty()
 
     def upsert_snapshots_batch(self, snapshots: list):
         """
         Insert or update multiple snapshots in a single batch.
         Each item is a tuple (path, size, mtime, md5_hash).
+        Paths are normalized to lowercase before storage.
         """
         if not snapshots:
             return
@@ -244,7 +262,7 @@ class Database:
                 mtime     = excluded.mtime,
                 md5_hash  = excluded.md5_hash,
                 last_seen = excluded.last_seen
-        """, [(p, s, m, h, now) for p, s, m, h in snapshots])
+        """, [(_normalize(p), s, m, h, now) for p, s, m, h in snapshots])
         self.conn.commit()
 
     def delete_snapshot(self, path: str):
@@ -252,7 +270,7 @@ class Database:
         Removes a file from the snapshot table.
         Called when a file is confirmed deleted or moved away from its old path.
         """
-        self.conn.execute("DELETE FROM snapshots WHERE path = ?", (path,))
+        self.conn.execute("DELETE FROM snapshots WHERE path = ?", (_normalize(path),))
         self._mark_dirty()
 
     def delete_snapshots_batch(self, paths: list):
@@ -263,7 +281,7 @@ class Database:
             return
         self.conn.executemany(
             "DELETE FROM snapshots WHERE path = ?",
-            [(p,) for p in paths]
+            [(_normalize(p),) for p in paths]
         )
         self.conn.commit()
 
@@ -272,6 +290,7 @@ class Database:
         Returns the entire snapshot table as a dictionary:
         { filepath: { size, mtime, md5_hash } }
         Used during startup diff to compare against the current directory state.
+        Paths are returned as-stored (already normalized to lowercase).
         """
         cursor = self.conn.execute(
             "SELECT path, size, mtime, md5_hash FROM snapshots"
@@ -299,6 +318,7 @@ class Database:
         dest_path is only used for MOVED/RENAMED events.
         prev_hash is the hash of the file before a MODIFIED event — allows
         before/after comparison without storing file contents.
+        Paths are normalized to lowercase before storage.
 
         Writes are batched — commit happens after N writes or 1 second,
         whichever comes first.
@@ -308,7 +328,7 @@ class Database:
             INSERT INTO events (timestamp, event_type, src_path, dest_path,
                                 file_size, md5_hash, prev_hash)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (timestamp, event_type, src_path, dest_path,
+        """, (timestamp, event_type, _normalize(src_path), _normalize(dest_path),
               file_size, md5_hash, prev_hash))
         self._mark_dirty()
 

@@ -258,7 +258,7 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
         )
     )
     log.info("Startup diff done. %d offline change(s) detected.", total_changes)
-
+    db.flush()
     return total_changes
 
 
