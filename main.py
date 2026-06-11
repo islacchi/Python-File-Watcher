@@ -487,6 +487,7 @@ def main():
     db.purge_old_events(retention)
 
     # Step 6: detect offline changes
+    db.upsert_config("status", "scanning")
     total_changes = run_startup_diff(db, config)
 
     # If --once mode, print summary and exit
@@ -504,6 +505,7 @@ def main():
 
     run_with_reconnect(watch_dir, recursive, handler, reconnect_delay)
 
+    db.upsert_config("status", "offline")
     db.close()
     log.info("File Watcher stopped.")
 
