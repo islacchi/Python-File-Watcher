@@ -237,9 +237,12 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
         for p in missing_paths
         if old_snapshot[p]["md5_hash"]
     }
-
     resolved_as_move_old = set()
     resolved_as_move_new = set()
+
+    events_to_log   = []
+    snapshots_to_upsert = []
+    snapshots_to_delete = []
 
     for path in new_paths:
         new_hash = current_snapshot[path]["md5_hash"]
@@ -247,45 +250,68 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
             old_path = deleted_by_hash[new_hash]
             info = current_snapshot[path]
             event_type = classify_path_change(old_path, path) + " (offline)"
-            db.log_event(event_type, old_path, dest_path=path,
-                         file_size=info["size"], md5_hash=new_hash)
-            db.delete_snapshot(old_path)
-            db.upsert_snapshot(path, info["size"], info["mtime"], new_hash)
+            events_to_log.append({
+                "event_type": event_type,
+                "src_path":   old_path,
+                "dest_path":  path,
+                "file_size":  info["size"],
+                "md5_hash":   new_hash,
+                "prev_hash":  None,
+            })
+            snapshots_to_delete.append(old_path)
+            snapshots_to_upsert.append((path, info["size"], info["mtime"], new_hash))
             resolved_as_move_old.add(old_path)
             resolved_as_move_new.add(path)
 
     for path in missing_paths - resolved_as_move_old:
-        db.log_event("DELETED (offline)", path)
-        db.delete_snapshot(path)
+        events_to_log.append({
+            "event_type": "DELETED (offline)",
+            "src_path":   path,
+            "dest_path":  None,
+            "file_size":  None,
+            "md5_hash":   None,
+            "prev_hash":  None,
+        })
+        snapshots_to_delete.append(path)
 
     for path in new_paths - resolved_as_move_new:
         info = current_snapshot[path]
-        db.log_event("CREATED (offline)", path,
-                     file_size=info["size"], md5_hash=info["md5_hash"])
-        db.upsert_snapshot(path, info["size"], info["mtime"], info["md5_hash"])
+        events_to_log.append({
+            "event_type": "CREATED (offline)",
+            "src_path":   path,
+            "dest_path":  None,
+            "file_size":  info["size"],
+            "md5_hash":   info["md5_hash"],
+            "prev_hash":  None,
+        })
+        snapshots_to_upsert.append((path, info["size"], info["mtime"], info["md5_hash"]))
 
     for path in common_paths:
         old_hash = old_snapshot[path]["md5_hash"]
         new_hash = current_snapshot[path]["md5_hash"]
         if old_hash != new_hash:
             info = current_snapshot[path]
-            db.log_event("MODIFIED (offline)", path,
-                         file_size=info["size"], md5_hash=new_hash)
-            db.upsert_snapshot(path, info["size"], info["mtime"], new_hash)
+            events_to_log.append({
+                "event_type": "MODIFIED (offline)",
+                "src_path":   path,
+                "dest_path":  None,
+                "file_size":  info["size"],
+                "md5_hash":   new_hash,
+                "prev_hash":  old_hash,
+            })
+            snapshots_to_upsert.append((path, info["size"], info["mtime"], new_hash))
 
-    total_changes = (
-        len(resolved_as_move_old) +
-        len(missing_paths - resolved_as_move_old) +
-        len(new_paths - resolved_as_move_new) +
-        sum(
-            1 for p in common_paths
-            if old_snapshot[p]["md5_hash"] != current_snapshot[p]["md5_hash"]
-        )
-    )
-    log.info("Startup diff done. %d offline change(s) detected.", total_changes)
+    # Commit all changes in three bulk operations instead of one per event
+    db.delete_snapshots_batch(snapshots_to_delete)
+    db.log_events_batch(events_to_log)
+    db.upsert_snapshots_batch(snapshots_to_upsert)
     db.flush()
-    return total_changes
 
+    total_changes = len(events_to_log)
+    log.info("Startup diff done. %d offline change(s) detected.", total_changes)
+
+    return total_changes
+    
 
 # ------------------------------------------------------------------
 # OBSERVER MANAGEMENT — handles network drive disconnects
