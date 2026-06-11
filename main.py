@@ -344,7 +344,8 @@ def start_heartbeat(db: Database, interval: int = 30):
             try:
                 db.upsert_config(
                     "heartbeat",
-                    __import__("datetime").datetime.now().isoformat()
+                    __import__("datetime").datetime.now().isoformat(),
+                    immediate=False
                 )
             except Exception as e:
                 log.warning("Heartbeat write failed: %s", e)

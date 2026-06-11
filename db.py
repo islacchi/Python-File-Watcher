@@ -365,11 +365,17 @@ class Database:
     # CONFIG TABLE OPERATIONS
     # ------------------------------------------------------------------
 
-    def upsert_config(self, key: str, value: str):
+    def upsert_config(self, key: str, value: str, immediate: bool = True):
         """
         Inserts or updates a single row in the config table.
         Called on every startup to keep the UI informed of the current
         script state — watch directory, start time, retention setting, etc.
+
+        immediate=True  (default) commits right away — used for startup
+                        writes where durability matters.
+        immediate=False batches the write — used for high-frequency writes
+                        like the heartbeat where immediate durability is
+                        not required.
         """
         now = datetime.now().isoformat()
         self.conn.execute("""
@@ -379,7 +385,11 @@ class Database:
                 value   = excluded.value,
                 updated = excluded.updated
         """, (key, value, now))
-        self.conn.commit()  # config writes are rare — commit immediately
+
+        if immediate:
+            self.conn.commit()
+        else:
+            self._mark_dirty()
 
     def get_config(self, key: str) -> str | None:
         """
