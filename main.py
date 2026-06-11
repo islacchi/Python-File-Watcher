@@ -17,6 +17,12 @@ Performance optimisations:
   - Parallel hashing with progress, no wasteful sampling phase
   - mtime pre-filter avoids re-hashing unchanged files
   - SIGTERM handler for clean shutdown when run as a service
+
+Path normalization:
+  - All paths passed to db.py are lowercased before any comparison or storage
+  - scan_directory() normalizes os.walk() output to lowercase so set
+    operations against the stored snapshot never produce false positives
+    due to case differences on Windows network drives
 """
 
 import os
@@ -78,6 +84,11 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
     Walks the watch_directory right now and returns its current state as:
     { filepath: { size, mtime, md5_hash } }
 
+    All returned paths are normalized to lowercase so they compare correctly
+    against snapshot paths loaded from SQLite (which are also stored lowercase).
+    This prevents false-positive DELETED (offline) events caused by case
+    differences between os.walk() output and stored snapshot paths.
+
     Performance optimisations:
       1. mtime pre-filter  — if a file's size and mtime match the last snapshot,
                               reuse the stored hash instead of re-hashing the file.
@@ -91,6 +102,9 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
     if exclude_dirs is None:
         exclude_dirs = set()
 
+    # Normalize exclude_dirs to lowercase for consistent comparison
+    exclude_dirs = {d.lower() for d in exclude_dirs}
+
     candidates = []
 
     walker = os.walk(watch_dir) if recursive else [
@@ -100,8 +114,11 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
     for root, dirs, files in walker:
         # Filter out excluded directories in-place so os.walk skips them
         if exclude_dirs:
-            dirs[:] = [d for d in dirs if d not in exclude_dirs
-                       and os.path.join(root, d) not in exclude_dirs]
+            dirs[:] = [
+                d for d in dirs
+                if d.lower() not in exclude_dirs
+                and os.path.join(root, d).lower() not in exclude_dirs
+            ]
 
         for filename in files:
             if any(prefix and filename.startswith(prefix) for prefix in ignore_prefixes):
@@ -109,22 +126,24 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
             ext = os.path.splitext(filename)[1].lower()
             if ext not in watch_extensions:
                 continue
-            path = os.path.join(root, filename)
-            size, mtime = get_file_info(path)
+            # Normalize path to lowercase — this is the core fix that prevents
+            # case-mismatch false positives during startup diff set operations
+            path = os.path.join(root, filename).lower()
+            size, mtime = get_file_info(os.path.join(root, filename))
             if size is not None:
-                candidates.append((path, size, mtime))
+                candidates.append((path, size, mtime, os.path.join(root, filename)))
 
     current = {}
     to_hash = []
     skipped = 0
 
-    for path, size, mtime in candidates:
+    for path, size, mtime, real_path in candidates:
         snap = old_snapshot.get(path)
         if snap and snap["size"] == size and snap["mtime"] == mtime and snap["md5_hash"]:
             current[path] = {"size": size, "mtime": mtime, "md5_hash": snap["md5_hash"]}
             skipped += 1
         else:
-            to_hash.append((path, size, mtime))
+            to_hash.append((path, size, mtime, real_path))
 
     log.info("mtime pre-filter: %d unchanged, %d need hashing.", skipped, len(to_hash))
 
@@ -132,8 +151,8 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
         max_workers = min(8, len(to_hash))
 
         def hash_file(args):
-            path, size, mtime = args
-            file_hash = compute_hash(path, hash_algorithm)
+            path, size, mtime, real_path = args
+            file_hash = compute_hash(real_path, hash_algorithm)
             return path, size, mtime, file_hash
 
         def format_eta(seconds: float) -> str:
@@ -178,6 +197,10 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
     """
     Compares the saved SQLite snapshot against the actual current directory state.
     Uses batch database operations for better performance.
+
+    Both old_snapshot (from SQLite) and current_snapshot (from scan_directory)
+    use lowercase-normalized paths, so set operations never produce false
+    positives from case differences.
     """
     watch_dir      = config["watcher"]["watch_directory"]
     recursive      = config["watcher"].getboolean("recursive", True)
@@ -195,7 +218,9 @@ def run_startup_diff(db: Database, config: configparser.ConfigParser):
 
     log.info("Scanning for offline changes...")
 
+    # get_all_snapshots() returns paths as stored — already lowercase
     old_snapshot     = db.get_all_snapshots()
+    # scan_directory() normalizes all paths to lowercase before returning
     current_snapshot = scan_directory(
         watch_dir, watch_ext, ignore_pfx, hash_algorithm, recursive,
         exclude_dirs=exclude_dirs, old_snapshot=old_snapshot
@@ -434,7 +459,7 @@ def main():
     # Step 5: purge old events
     db.purge_old_events(retention)
 
-    # Step 5: detect offline changes
+    # Step 6: detect offline changes
     total_changes = run_startup_diff(db, config)
 
     # If --once mode, print summary and exit
@@ -443,10 +468,10 @@ def main():
         db.close()
         return
 
-    # Step 6: start heartbeat so the Laravel UI knows the script is alive
+    # Step 7: start heartbeat so the Laravel UI knows the script is alive
     start_heartbeat(db, heartbeat_interval)
 
-    # Step 7: start live watcher with reconnect support
+    # Step 8: start live watcher with reconnect support
     handler = FileWatchHandler(db, config)
     log.info("Live watcher active. Press Ctrl+C to stop.")
 
