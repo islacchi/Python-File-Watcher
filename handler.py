@@ -299,8 +299,7 @@ class FileWatchHandler(FileSystemEventHandler):
         path = event.src_path
 
         # Retrieve the file's last known hash from the snapshot
-        snapshots = self.db.get_all_snapshots()
-        file_hash = snapshots.get(path, {}).get("md5_hash")
+        file_hash = self.db.get_snapshot_hash(path)
 
         if file_hash:
             deadline = time.time() + self.move_window
