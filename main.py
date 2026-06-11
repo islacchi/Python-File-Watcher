@@ -29,6 +29,7 @@ import os
 import sys
 import time
 import signal
+import threading
 import configparser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from watchdog.observers import Observer
@@ -337,7 +338,6 @@ def start_heartbeat(db: Database, interval: int = 30):
     The thread is a daemon — it dies automatically when main.py exits,
     so no manual cleanup is needed.
     """
-    import threading
 
     def _beat():
         while not _shutdown_requested:
