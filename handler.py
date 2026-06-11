@@ -84,39 +84,6 @@ def classify_path_change(src: str, dest: str) -> str:
     else:
         return "MOVED_AND_RENAMED"
 
-
-def _scan_dir_for_hash(watch_dir: str, target_hash: str,
-                       hash_algorithm: str, skip_path: str | None,
-                       filter_fn) -> str | None:
-    """
-    Efficiently scans watch_dir using os.scandir() looking for a file
-    whose hash matches target_hash. Returns the matching path, or None.
-
-    This is used by the single background sweep thread instead of
-    spawning one os.walk() per deleted file.
-    """
-    # Iterative stack-based recursion to avoid deep recursion limits
-    stack = [watch_dir]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
-                    elif entry.is_file(follow_symlinks=False):
-                        if not filter_fn(entry.path):
-                            continue
-                        if entry.path == skip_path:
-                            continue
-                        # Quick size check before hashing
-                        if compute_hash(entry.path, hash_algorithm) == target_hash:
-                            return entry.path
-        except PermissionError:
-            continue
-    return None
-
-
 # ------------------------------------------------------------------
 # WATCHDOG EVENT HANDLER
 # ------------------------------------------------------------------
