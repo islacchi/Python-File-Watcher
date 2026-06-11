@@ -290,6 +290,15 @@ python query.py          [query.py]   → reads filelog.db directly
 
 - **Move detection window** — when a file is deleted and recreated (cross-folder move), the script polls the watch directory every second for up to `move_window` seconds looking for a file with a matching hash. The MOVED event is logged the moment the file finishes copying — not after a blind wait. If no match is found within the window, it is confirmed as a DELETE. Increase `move_window` in `config.ini` if large files on slow network drives are still being logged as DELETE + CREATE instead of MOVED.
 
+- **Bulk operations may cause missed live events (Windows)** — on Windows,
+  watchdog uses the `ReadDirectoryChangesW` API which has a fixed-size event
+  buffer. If a large number of files change simultaneously (e.g. a bulk copy
+  or mass rename operation), the buffer can overflow and watchdog will silently
+  miss some live events. This does not cause data corruption — any missed events
+  will be detected and logged as `(offline)` variants on the next restart when
+  the startup diff compares the snapshot against the current drive state.
+  There is no workaround within the script itself; this is an OS-level constraint.
+
 - **Network drive hashing is slower than local** — MD5 hashing over a network connection is limited by network bandwidth, not disk speed. Pointing `watch_directory` to a specific subfolder rather than the drive root significantly reduces startup time.
 
 - **No content logging** — the script records that a file changed and its MD5 hash, but does not store the file's contents or a diff of what changed inside it.
