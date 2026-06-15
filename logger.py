@@ -15,9 +15,6 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
-_loggers = {}  # cache so the same logger isn't created twice
-
-
 def setup_logging(log_directory: str):
     """
     Call once from main.py on startup.

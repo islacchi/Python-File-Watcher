@@ -73,6 +73,7 @@ All settings live in `config.ini`. No code changes needed.
 | `recursive` | `[watcher]` | `true` | Watch subdirectories recursively |
 | `reconnect_delay` | `[watcher]` | `30` | Seconds to wait before retrying if drive goes offline |
 | `move_window` | `[watcher]` | `10` | Seconds to poll for a matching file after DELETE before confirming it as a delete |
+| `heartbeat_interval` | `[watcher]` | `30` | Seconds between heartbeat writes to the config table (used by Laravel UI health check) |
 | `watch_extensions` | `[filters]` | see file | Whitelist of file extensions to track |
 | `ignore_prefixes` | `[filters]` | `~$, .~, ~` | Filename prefixes to ignore (Office lock files) |
 | `log_directory` | `[storage]` | — | Where to save `filelog.db` and `filewatcher.log` |
@@ -183,6 +184,36 @@ SELECT * FROM events WHERE timestamp LIKE '2026-05-26%'
 
 ---
 
+## Path Normalization
+
+All file paths are stored and compared as lowercase strings. This prevents
+false-positive `DELETED (offline)` events on Windows network drives where
+`os.walk()` and the stored snapshot may return the same path in different
+cases (e.g. `\\Kyle\bid docs\` vs `\\kyle\bid docs\`).
+
+> **If you reset the snapshots table** (e.g. `DELETE FROM snapshots`), the next
+> startup will log every existing file as `CREATED (offline)`. This is expected
+> and only happens once — the snapshot rebuilds itself on that restart and all
+> subsequent startups will diff correctly.
+
+---
+
+## Config Table
+
+The `config` table in `filelog.db` stores script metadata readable by external
+tools such as the Laravel UI:
+
+| Key | Description |
+|-----|-------------|
+| `watch_directory` | The directory currently being monitored |
+| `log_directory` | Where logs and the database are stored |
+| `retention_days` | Current retention setting |
+| `script_version` | Version string from `main.py` |
+| `started_at` | ISO 8601 timestamp of last startup |
+| `heartbeat` | ISO 8601 timestamp updated every `heartbeat_interval` seconds — used to determine if the script is currently alive |
+
+---
+
 ## Architecture
 
 ```
@@ -207,14 +238,21 @@ Purge old events         [db.py]      → deletes rows older than retention_days
 ── STARTUP DIFF ──────────────────────────────────────────────────
       │
       ▼
-Scan watch directory     [main.py]    → mtime pre-filter → sample 5 → ETA
-      │                               → parallel hash remaining files
+Scan watch directory     [main.py]    → normalize paths to lowercase
+      │                               → mtime pre-filter → reuse stored hash
+      │                               → parallel hash remaining files + ETA
       ▼
 Diff snapshot vs disk    [main.py]    → hash match: RENAMED / MOVED /
       │                                 MOVED_AND_RENAMED / CREATED / DELETED
       ▼
 Log offline events       [db.py]      → db.log_event() + update snapshots
+      │                               → db.flush() ensures commit before returning
+      ▼
+── HEARTBEAT ─────────────────────────────────────────────────────
       │
+      ▼
+Heartbeat thread starts  [main.py]    → daemon thread, upserts config.heartbeat
+      │                                 every heartbeat_interval seconds
       ▼
 ── LIVE WATCHER ──────────────────────────────────────────────────
       │
@@ -228,11 +266,13 @@ File system event fires  [handler.py] → on_created / on_modified
 Extension + prefix filter             → skip ~$ prefixes, check whitelist
       │
       ▼
-Classify event           [handler.py] → DELETED polls every 1s up to move_window
+Classify event           [handler.py] → DELETED held in pending_deletes dict
+      │                               → single sweep thread checks expiry
       │                               → hash match found → RENAMED / MOVED
       │                               → window expires → confirmed DELETE
       ▼
 Log live event           [db.py]      → db.log_event() + upsert_snapshot()
+      │                               → all paths normalized to lowercase
       │
       └──────────────────────────────── loops back to next event
 
@@ -250,9 +290,20 @@ python query.py          [query.py]   → reads filelog.db directly
 
 - **Move detection window** — when a file is deleted and recreated (cross-folder move), the script polls the watch directory every second for up to `move_window` seconds looking for a file with a matching hash. The MOVED event is logged the moment the file finishes copying — not after a blind wait. If no match is found within the window, it is confirmed as a DELETE. Increase `move_window` in `config.ini` if large files on slow network drives are still being logged as DELETE + CREATE instead of MOVED.
 
+- **Bulk operations may cause missed live events (Windows)** — on Windows,
+  watchdog uses the `ReadDirectoryChangesW` API which has a fixed-size event
+  buffer. If a large number of files change simultaneously (e.g. a bulk copy
+  or mass rename operation), the buffer can overflow and watchdog will silently
+  miss some live events. This does not cause data corruption — any missed events
+  will be detected and logged as `(offline)` variants on the next restart when
+  the startup diff compares the snapshot against the current drive state.
+  There is no workaround within the script itself; this is an OS-level constraint.
+
 - **Network drive hashing is slower than local** — MD5 hashing over a network connection is limited by network bandwidth, not disk speed. Pointing `watch_directory` to a specific subfolder rather than the drive root significantly reduces startup time.
 
 - **No content logging** — the script records that a file changed and its MD5 hash, but does not store the file's contents or a diff of what changed inside it.
+
+- **Paths stored as lowercase** — all paths in the database are normalized to lowercase. This is intentional (see Path Normalization above) but means the original casing of filenames and directories is not preserved in the log.
 
 ---
 

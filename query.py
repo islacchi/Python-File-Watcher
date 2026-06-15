@@ -2,6 +2,9 @@
 query.py — Command-line log viewer
 Run this script to search and filter the events log without opening DB Browser.
 
+Reads the database path from config.ini by default.
+Override with --db if needed.
+
 Usage examples:
   python query.py                          # show last 50 events
   python query.py --limit 100             # show last 100 events
@@ -11,20 +14,51 @@ Usage examples:
   python query.py --today                 # events from today only
   python query.py --date 2026-05-26       # events from a specific date
   python query.py --summary              # count of each event type
+  python query.py --db C:\path\to\filelog.db  # override database path
 """
 
 import sqlite3
 import argparse
+import configparser
 import os
 import sys
 from datetime import date
 
 
 # ------------------------------------------------------------------
-# CONFIG — update db_path if your log directory differs
+# CONFIG
 # ------------------------------------------------------------------
 
-DEFAULT_DB_PATH = r"C:\Users\primelink\Desktop\LOGS\filelog.db"
+def resolve_db_path(override: str | None) -> str:
+    """
+    Returns the database path to use, in order of priority:
+      1. --db argument if provided
+      2. log_directory + db_name from config.ini in the same directory
+      3. Exits with a clear error if neither is available
+    """
+    if override:
+        return override
+
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "config.ini")
+
+    if not os.path.exists(config_path):
+        print("[ERROR] config.ini not found and no --db path provided.")
+        print(f"        Expected config at: {config_path}")
+        print("        Run: python query.py --db C:\\path\\to\\filelog.db")
+        sys.exit(1)
+
+    config = configparser.ConfigParser()
+    config.read(config_path)
+
+    try:
+        log_dir = config["storage"]["log_directory"]
+        db_name = config["storage"].get("db_name", "filelog.db")
+    except KeyError:
+        print("[ERROR] config.ini is missing [storage] section or log_directory key.")
+        sys.exit(1)
+
+    return os.path.join(log_dir, db_name)
 
 
 # ------------------------------------------------------------------
@@ -36,28 +70,29 @@ def get_connection(db_path: str) -> sqlite3.Connection:
         print(f"[ERROR] Database not found at: {db_path}")
         print("Make sure the file watcher has been run at least once.")
         sys.exit(1)
-    return sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row  # named column access instead of positional
+    return conn
 
 
-def format_row(row: tuple) -> str:
+def format_row(row: sqlite3.Row) -> str:
     """Formats a single event row for readable terminal output."""
-    id_, timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash = row
-    size_str = f"{file_size:,} bytes" if file_size else "N/A"
+    size_str = f"{row['file_size']:,} bytes" if row['file_size'] else "N/A"
 
-    if dest_path:
-        return (f"[{timestamp}] {event_type}\n"
-                f"  FROM : {src_path}\n"
-                f"  TO   : {dest_path}\n"
+    if row['dest_path']:
+        return (f"[{row['timestamp']}] {row['event_type']}\n"
+                f"  FROM : {row['src_path']}\n"
+                f"  TO   : {row['dest_path']}\n"
                 f"  SIZE : {size_str}\n")
-    elif event_type in ("MODIFIED", "MODIFIED (offline)") and prev_hash:
-        return (f"[{timestamp}] {event_type}\n"
-                f"  PATH : {src_path}\n"
-                f"  SIZE : {size_str}\n"
-                f"  BEFORE: {prev_hash}\n"
-                f"  AFTER : {md5_hash}\n")
+    elif row['event_type'] in ("MODIFIED", "MODIFIED (offline)") and row['prev_hash']:
+        return (f"[{row['timestamp']}] {row['event_type']}\n"
+                f"  PATH  : {row['src_path']}\n"
+                f"  SIZE  : {size_str}\n"
+                f"  BEFORE: {row['prev_hash']}\n"
+                f"  AFTER : {row['md5_hash']}\n")
     else:
-        return (f"[{timestamp}] {event_type}\n"
-                f"  PATH : {src_path}\n"
+        return (f"[{row['timestamp']}] {row['event_type']}\n"
+                f"  PATH : {row['src_path']}\n"
                 f"  SIZE : {size_str}\n")
 
 
@@ -92,7 +127,8 @@ def query_events(conn: sqlite3.Connection, event_type: str = None,
     params.append(limit)
 
     query = f"""
-        SELECT id, timestamp, event_type, src_path, dest_path, file_size, md5_hash, prev_hash
+        SELECT id, timestamp, event_type, src_path, dest_path,
+               file_size, md5_hash, prev_hash
         FROM events
         {where}
         ORDER BY timestamp DESC
@@ -116,11 +152,11 @@ def query_summary(conn: sqlite3.Connection):
         print("No events logged yet.")
         return
 
-    max_len = max(len(r[0]) for r in rows)
-    for event_type, count in rows:
-        print(f"  {event_type:<{max_len}}  {count:>6} event(s)")
+    max_len = max(len(r['event_type']) for r in rows)
+    for row in rows:
+        print(f"  {row['event_type']:<{max_len}}  {row['count']:>6} event(s)")
 
-    total = sum(r[1] for r in rows)
+    total = sum(r['count'] for r in rows)
     print(f"\n  {'TOTAL':<{max_len}}  {total:>6} event(s)\n")
 
 
@@ -133,8 +169,8 @@ def main():
         description="Query the file watcher event log."
     )
     parser.add_argument(
-        "--db", default=DEFAULT_DB_PATH,
-        help="Path to filelog.db (default: configured path)"
+        "--db", default=None,
+        help="Path to filelog.db (default: read from config.ini)"
     )
     parser.add_argument(
         "--type", dest="event_type",
@@ -161,8 +197,9 @@ def main():
         help="Show a count of each event type instead of individual events"
     )
 
-    args = parser.parse_args()
-    conn = get_connection(args.db)
+    args    = parser.parse_args()
+    db_path = resolve_db_path(args.db)
+    conn    = get_connection(db_path)
 
     if args.summary:
         query_summary(conn)
