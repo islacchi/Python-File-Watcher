@@ -102,8 +102,7 @@ class Database:
                 ON events(timestamp);
 
             -- config table: stores script metadata readable by the Laravel UI
-            -- One row per key, upserted on every startup
-            with self._db_lock:                    
+            -- One row per key, upserted on every startup                    
             CREATE TABLE IF NOT EXISTS config (
                 key         TEXT UNIQUE NOT NULL,
                 value       TEXT,
