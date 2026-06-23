@@ -109,10 +109,6 @@ class Database:
                 value       TEXT,
                 updated     TEXT
             );
-
-            -- Add prev_hash to existing databases that predate this column
-            -- This is a no-op if the column already exists
-            PRAGMA legacy_alter_table = ON;
         """)
         self.conn.commit()
 
