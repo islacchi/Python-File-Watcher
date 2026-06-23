@@ -126,9 +126,13 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
                 if hashed_count % 50 == 0 or hashed_count == total:
                     elapsed = time.time() - batch_start
                     if elapsed > 0:
-                        rate     = hashed_count / elapsed / max(max_workers, 1)
+                        # Rate is total wall-clock throughput (files/sec).
+                        # Do not divide by max_workers — elapsed already
+                        # reflects parallelism. Dividing again produces
+                        # ETAs 8x too short with 8 workers.
+                        rate     = hashed_count / elapsed
                         left     = total - hashed_count
-                        eta_secs = (left / rate / max(max_workers, 1)) if rate > 0 else 0
+                        eta_secs = (left / rate) if rate > 0 else 0
                         log.info(
                             "Progress: %d / %d file(s) hashed. ETA: %s",
                             hashed_count, total, format_eta(eta_secs)
