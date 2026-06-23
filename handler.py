@@ -112,19 +112,27 @@ class FileWatchHandler(FileSystemEventHandler):
                 log.warning("Sweep thread error: %s", e, exc_info=True)
 
     def _sweep_expired(self):
-        """Check each pending delete — if deadline passed, log as genuine DELETE."""
-        now       = time.time()
-        to_delete = []
+            """
+            Check each pending delete — if deadline passed, log as genuine DELETE.
 
-        with self._lock:
-            for file_hash, (orig_path, deadline) in list(self.pending_deletes.items()):
-                if now >= deadline:
-                    to_delete.append((file_hash, orig_path))
+            Both the identification of expired entries and the pop/log must happen
+            inside a single lock acquisition. If they were split across two separate
+            with self._lock blocks, on_created could acquire the lock between them,
+            claim the entry as a MOVE and pop it, then the sweep would re-enter,
+            find pop() returning None, and still unconditionally log a phantom DELETE.
+            """
+            now       = time.time()
+            to_delete = []
 
-            for file_hash, orig_path in to_delete:
-                self.pending_deletes.pop(file_hash, None)
-                self.db.log_event("DELETED", orig_path)
-                self.db.delete_snapshot(orig_path)
+            with self._lock:
+                for key, (orig_path, deadline) in list(self.pending_deletes.items()):
+                    if now >= deadline:
+                        to_delete.append((key, orig_path))
+
+                for key, orig_path in to_delete:
+                    self.pending_deletes.pop(key, None)
+                    self.db.log_event("DELETED", orig_path)
+                    self.db.delete_snapshot(orig_path)
 
     # ------------------------------------------------------------------
     # WATCHDOG CALLBACKS
