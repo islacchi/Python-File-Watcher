@@ -51,8 +51,15 @@ class FileWatchHandler(FileSystemEventHandler):
         self.hash_algorithm  = config["snapshot"]["hash_algorithm"]
         self.db              = db
 
-        # Move detection: { md5_hash: (original_path, deadline_timestamp) }
-        self.pending_deletes: dict = {}
+        # Move detection: { (normcase_path, md5_hash): (original_path, deadline_timestamp) }
+        # Composite key prevents two distinct collision bugs:
+        #   1. Files with no snapshot entry all return hash=None — a hash-only
+        #      key collapses every hashless deletion onto the same None key,
+        #      so each overwrites the last.
+        #   2. Two files with identical content (e.g. both empty) share the
+        #      same MD5 — a hash-only key causes the second deletion to
+        #      silently clobber the first.
+        self.pending_deletes: dict[tuple, tuple] = {}
         self.move_window: float    = config["watcher"].getfloat("move_window", 2.0)
         self.watch_directory: str  = config["watcher"]["watch_directory"]
 
@@ -186,10 +193,12 @@ class FileWatchHandler(FileSystemEventHandler):
         path      = event.src_path
         file_hash = self.db.get_snapshot_hash(path)
 
-        if file_hash:
-            deadline = time.time() + self.move_window
-            with self._lock:
-                self.pending_deletes[file_hash] = (path, deadline)
+        # Key is (normcase_path, hash) — unique per source file even when
+        # hash is None or when multiple files share the same hash.
+        key      = (os.path.normcase(path), file_hash)
+        deadline = time.time() + self.move_window
+        with self._lock:
+            self.pending_deletes[key] = (path, deadline)
 
     def on_moved(self, event):
         """
