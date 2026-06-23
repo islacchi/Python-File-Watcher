@@ -370,8 +370,23 @@ class Database:
         Snapshots are never purged — they represent current file state.
         Called once on every startup before the diff runs.
         Uses the idx_events_timestamp index for fast deletion.
+
+        retention_days semantics:
+          > 0  purge events older than N days.
+          = 0  keep all events indefinitely; no purge performed.
+          < 0  invalid — almost certainly a config typo; logs a warning.
         """
-        if retention_days <= 0:
+        if retention_days < 0:
+            log.warning(
+                "retention_days is %d (negative) — skipping purge. "
+                "Set to 0 to keep all events indefinitely, "
+                "or a positive integer to enable cleanup.",
+                retention_days,
+            )
+            return
+
+        if retention_days == 0:
+            log.info("retention_days = 0: keeping all events indefinitely.")
             return
 
         cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
@@ -384,6 +399,8 @@ class Database:
         if cursor.rowcount:
             log.info("Purged %d event(s) older than %d day(s).",
                      cursor.rowcount, retention_days)
+        else:
+            log.info("No events older than %d day(s) to purge.", retention_days)
 
     # ------------------------------------------------------------------
     # CONFIG TABLE OPERATIONS
