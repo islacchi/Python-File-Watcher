@@ -71,7 +71,12 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
             ext = os.path.splitext(filename)[1].lower()
             if ext not in watch_extensions:
                 continue
-            # Normalize path to lowercase — prevents case-mismatch false positives
+            # path      — lowercase-normalized; used as the DB/dict key only.
+            #             NEVER pass to os.stat(), open(), or compute_hash() —
+            #             on case-sensitive filesystems (Linux, most NFS/SMB
+            #             mounts) a lowercased path may not exist and will
+            #             raise FileNotFoundError.
+            # real_path — original OS casing; use for all filesystem access.
             path      = os.path.join(root, filename).lower()
             real_path = os.path.join(root, filename)
             size, mtime = get_file_info(real_path)
