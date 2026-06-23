@@ -170,6 +170,13 @@ class FileWatchHandler(FileSystemEventHandler):
         Fires when an existing file's contents or metadata change.
         Only logs if the hash actually changed — skips metadata-only touches.
         prev_hash captures the before state for before/after comparison.
+
+        NOTE: There is an inherent TOCTOU window between get_snapshot_hash()
+        and compute_hash(). A second write in that gap means prev_hash reflects
+        version N-1 while file_hash reflects N+1 — version N is never recorded.
+        This is unfixable without holding a file lock across both calls, which
+        would block writers. The OS also coalesces rapid writes into one event,
+        so intermediate versions can be missed regardless of implementation.
         """
         if event.is_directory or not self._should_watch(event.src_path):
             return
