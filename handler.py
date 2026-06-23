@@ -134,6 +134,26 @@ class FileWatchHandler(FileSystemEventHandler):
                     self.db.log_event("DELETED", orig_path)
                     self.db.delete_snapshot(orig_path)
 
+
+    def _find_pending_delete_key(
+        self, new_path: str, file_hash: str | None
+    ) -> tuple | None:
+        """
+        Search pending_deletes for an entry whose hash matches file_hash
+        and whose source path differs from new_path.
+        Must be called with self._lock already held.
+        Returns the matching key, or None if no match found.
+        """
+        if file_hash is None:
+            return None
+
+        for key, (orig_path, _deadline) in self.pending_deletes.items():
+            _stored_path, stored_hash = key
+            if stored_hash == file_hash and orig_path != new_path:
+                return key
+
+        return None
+    
     # ------------------------------------------------------------------
     # WATCHDOG CALLBACKS
     # ------------------------------------------------------------------
@@ -152,15 +172,16 @@ class FileWatchHandler(FileSystemEventHandler):
         size, mtime = get_file_info(path)
 
         with self._lock:
-            if file_hash and file_hash in self.pending_deletes:
-                old_path, _ = self.pending_deletes.pop(file_hash)
-                event_type  = classify_path_change(old_path, path)
-                self.db.log_event(event_type, old_path, dest_path=path,
-                                  file_size=size, md5_hash=file_hash)
-                self.db.delete_snapshot(old_path)
-            else:
-                self.db.log_event("CREATED", path,
-                                  file_size=size, md5_hash=file_hash)
+                    match_key = self._find_pending_delete_key(path, file_hash)
+                    if match_key is not None:
+                        old_path, _ = self.pending_deletes.pop(match_key)
+                        event_type  = classify_path_change(old_path, path)
+                        self.db.log_event(event_type, old_path, dest_path=path,
+                                        file_size=size, md5_hash=file_hash)
+                        self.db.delete_snapshot(old_path)
+                    else:
+                        self.db.log_event("CREATED", path,
+                                        file_size=size, md5_hash=file_hash)
 
         if size is not None:
             self.db.upsert_snapshot(path, size, mtime, file_hash)
