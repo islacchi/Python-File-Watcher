@@ -98,9 +98,17 @@ class Database:
                     prev_hash   TEXT
                 );
 
-                -- Fast lookup for purge_old_events()
+                -- Fast range queries in purge_old_events() and date filters
                 CREATE INDEX IF NOT EXISTS idx_events_timestamp
                     ON events(timestamp);
+
+                -- Fast filtering by event type in getFilteredEvents()
+                CREATE INDEX IF NOT EXISTS idx_events_event_type
+                    ON events(event_type);
+
+                -- Fast filtering by source path in getFilteredEvents()
+                CREATE INDEX IF NOT EXISTS idx_events_src_path
+                    ON events(src_path);
 
                 -- config table: stores script metadata readable by the Laravel UI
                 -- One row per key, upserted on every startup                    
