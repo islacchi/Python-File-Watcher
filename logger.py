@@ -15,6 +15,11 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
+# Silences 'No handlers could be found' warnings for log calls issued
+# before setup_logging() is called (e.g. config.py at import time).
+# setup_logging() strips this before installing the real handlers.
+logging.getLogger("filewatcher").addHandler(logging.NullHandler())
+
 def setup_logging(log_directory: str):
     """
     Call once from main.py on startup.
@@ -27,6 +32,12 @@ def setup_logging(log_directory: str):
 
     root_logger = logging.getLogger("filewatcher")
     root_logger.setLevel(logging.DEBUG)
+
+    # Remove bootstrap NullHandler before adding real handlers
+    root_logger.handlers = [
+        h for h in root_logger.handlers
+        if not isinstance(h, logging.NullHandler)
+    ]
 
     # Avoid adding duplicate handlers if setup_logging is called more than once
     if root_logger.handlers:

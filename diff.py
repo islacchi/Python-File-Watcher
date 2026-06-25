@@ -71,7 +71,12 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
             ext = os.path.splitext(filename)[1].lower()
             if ext not in watch_extensions:
                 continue
-            # Normalize path to lowercase — prevents case-mismatch false positives
+            # path      — lowercase-normalized; used as the DB/dict key only.
+            #             NEVER pass to os.stat(), open(), or compute_hash() —
+            #             on case-sensitive filesystems (Linux, most NFS/SMB
+            #             mounts) a lowercased path may not exist and will
+            #             raise FileNotFoundError.
+            # real_path — original OS casing; use for all filesystem access.
             path      = os.path.join(root, filename).lower()
             real_path = os.path.join(root, filename)
             size, mtime = get_file_info(real_path)
@@ -126,9 +131,13 @@ def scan_directory(watch_dir: str, watch_extensions: set, ignore_prefixes: list,
                 if hashed_count % 50 == 0 or hashed_count == total:
                     elapsed = time.time() - batch_start
                     if elapsed > 0:
-                        rate     = hashed_count / elapsed / max(max_workers, 1)
+                        # Rate is total wall-clock throughput (files/sec).
+                        # Do not divide by max_workers — elapsed already
+                        # reflects parallelism. Dividing again produces
+                        # ETAs 8x too short with 8 workers.
+                        rate     = hashed_count / elapsed
                         left     = total - hashed_count
-                        eta_secs = (left / rate / max(max_workers, 1)) if rate > 0 else 0
+                        eta_secs = (left / rate) if rate > 0 else 0
                         log.info(
                             "Progress: %d / %d file(s) hashed. ETA: %s",
                             hashed_count, total, format_eta(eta_secs)

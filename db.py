@@ -46,9 +46,16 @@ class Database:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
 
+        # Serializes all conn.execute* calls across threads.
+        # check_same_thread=False disables sqlite3's guard but adds no
+        # synchronization — without this lock, concurrent calls from the
+        # watchdog, sweep, and heartbeat threads can corrupt connection state.
+        self._db_lock = threading.Lock()
+
         # Performance: WAL mode + relaxed sync for ~2-5x faster writes
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        with self._db_lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
 
         self._create_tables()
         self._migrate()
@@ -69,73 +76,100 @@ class Database:
         Creates both tables if they don't exist yet.
         Safe to call on every startup — IF NOT EXISTS prevents duplicates.
         """
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                path        TEXT    UNIQUE NOT NULL,
-                size        INTEGER,
-                mtime       REAL,
-                md5_hash    TEXT,
-                last_seen   TEXT
-            );
+        with self._db_lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path        TEXT    UNIQUE NOT NULL,
+                    size        INTEGER,
+                    mtime       REAL,
+                    md5_hash    TEXT,
+                    last_seen   TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp   TEXT    NOT NULL,
-                event_type  TEXT    NOT NULL,
-                src_path    TEXT    NOT NULL,
-                dest_path   TEXT,
-                file_size   INTEGER,
-                md5_hash    TEXT,
-                prev_hash   TEXT
-            );
+                CREATE TABLE IF NOT EXISTS events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp   TEXT    NOT NULL,
+                    event_type  TEXT    NOT NULL,
+                    src_path    TEXT    NOT NULL,
+                    dest_path   TEXT,
+                    file_size   INTEGER,
+                    md5_hash    TEXT,
+                    prev_hash   TEXT
+                );
 
-            -- Fast lookup for purge_old_events()
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp
-                ON events(timestamp);
+                -- Fast range queries in purge_old_events() and date filters
+                CREATE INDEX IF NOT EXISTS idx_events_timestamp
+                    ON events(timestamp);
 
-            -- config table: stores script metadata readable by the Laravel UI
-            -- One row per key, upserted on every startup
-            CREATE TABLE IF NOT EXISTS config (
-                key         TEXT UNIQUE NOT NULL,
-                value       TEXT,
-                updated     TEXT
-            );
+                -- Fast filtering by event type in getFilteredEvents()
+                CREATE INDEX IF NOT EXISTS idx_events_event_type
+                    ON events(event_type);
 
-            -- Add prev_hash to existing databases that predate this column
-            -- This is a no-op if the column already exists
-            PRAGMA legacy_alter_table = ON;
-        """)
+                -- Fast filtering by source path in getFilteredEvents()
+                CREATE INDEX IF NOT EXISTS idx_events_src_path
+                    ON events(src_path);
+
+                -- config table: stores script metadata readable by the Laravel UI
+                -- One row per key, upserted on every startup                    
+                CREATE TABLE IF NOT EXISTS config (
+                    key         TEXT UNIQUE NOT NULL,
+                    value       TEXT,
+                    updated     TEXT
+                );
+            """)
         self.conn.commit()
 
     def _migrate(self):
         """
-        Adds prev_hash column to the events table if it does not exist yet.
-        Handles databases created before this column was introduced — safe
-        to call on every startup, does nothing if column already exists.
+        Runs all incremental migrations on every startup.
+        Every migration uses IF NOT EXISTS or checks before altering so it
+        is safe to call repeatedly — already-applied migrations are no-ops.
+
+        Migrations:
+          1. prev_hash column — added for before/after hash comparison on MODIFIED
+          2. idx_events_event_type — added for fast tab and type filter queries
+          3. idx_events_src_path   — added for fast path search queries
         """
-        existing = {
-            row[1] for row in
-            self.conn.execute("PRAGMA table_info(events)").fetchall()
-        }
-        if "prev_hash" not in existing:
-            self.conn.execute(
-                "ALTER TABLE events ADD COLUMN prev_hash TEXT"
-            )
-            self.conn.commit()
-            log.info("Migrated events table: added prev_hash column.")
+        with self._db_lock:
+            # Migration 1: prev_hash column
+            existing_cols = {
+                row[1] for row in
+                self.conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "prev_hash" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE events ADD COLUMN prev_hash TEXT"
+                )
+                self.conn.commit()
+                log.info("Migration: added prev_hash column to events table.")
+
+            # Migration 2 & 3: performance indexes
+            # CREATE INDEX IF NOT EXISTS is a no-op if the index already exists.
+            # Runs on every startup so existing databases created before these
+            # indexes were introduced are upgraded automatically.
+            self.conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_events_event_type
+                    ON events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_events_src_path
+                    ON events(src_path);
+            """)
+            log.info("Migration: verified performance indexes on events table.")
 
     # ------------------------------------------------------------------
     # BATCHED COMMIT
     # ------------------------------------------------------------------
 
     def _maybe_flush(self):
-        """Commit if we've accumulated enough writes since last flush."""
-        with self._flush_lock:
-            self._write_count += 1
-            if self._write_count >= self._flush_interval:
-                self._write_count = 0
-                self.conn.commit()
+            """
+            Lock ordering: always acquire _flush_lock before _db_lock.
+            """
+            with self._flush_lock:
+                self._write_count += 1
+                if self._write_count >= self._flush_interval:
+                    self._write_count = 0
+                    with self._db_lock:
+                        self.conn.commit()
 
     def _start_timer(self):
         """Start a background timer that flushes every 1 second."""
@@ -148,11 +182,11 @@ class Database:
         self._flush_timer.start()
 
     def _timed_flush(self):
-        """Called by the timer thread — commits pending writes."""
         with self._flush_lock:
             if self._write_count > 0:
                 self._write_count = 0
-                self.conn.commit()
+                with self._db_lock:
+                    self.conn.commit()
         self._start_timer()
 
     def _mark_dirty(self):
@@ -167,7 +201,8 @@ class Database:
         with self._flush_lock:
             if self._write_count > 0:
                 self._write_count = 0
-                self.conn.commit()
+                with self._db_lock:
+                    self.conn.commit()
         if self._flush_timer is not None:
             self._flush_timer.cancel()
             self._flush_timer = None
@@ -202,12 +237,13 @@ class Database:
             for e in events
         ]
 
-        self.conn.executemany("""
-            INSERT INTO events (timestamp, event_type, src_path, dest_path,
-                                file_size, md5_hash, prev_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.executemany("""
+                INSERT INTO events (timestamp, event_type, src_path, dest_path,
+                                    file_size, md5_hash, prev_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+        self._mark_dirty()
 
     # ------------------------------------------------------------------
     # SNAPSHOT OPERATIONS
@@ -219,10 +255,11 @@ class Database:
         Used by on_modified to capture the previous hash before overwriting it.
         Returns None if the file is not in the snapshot yet.
         """
-        cursor = self.conn.execute(
-            "SELECT md5_hash FROM snapshots WHERE path = ?", (_normalize(path),)
-        )
-        row = cursor.fetchone()
+        with self._db_lock:
+            cursor = self.conn.execute(
+                "SELECT md5_hash FROM snapshots WHERE path = ?", (_normalize(path),)
+            )
+            row = cursor.fetchone()
         return row[0] if row else None
 
     def upsert_snapshot(self, path: str, size: int, mtime: float, md5_hash: str):
@@ -233,15 +270,16 @@ class Database:
         Path is normalized to lowercase before storage.
         """
         now = datetime.now().isoformat()
-        self.conn.execute("""
-            INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                size      = excluded.size,
-                mtime     = excluded.mtime,
-                md5_hash  = excluded.md5_hash,
-                last_seen = excluded.last_seen
-        """, (_normalize(path), size, mtime, md5_hash, now))
+        with self._db_lock:
+            self.conn.execute("""
+                INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    size      = excluded.size,
+                    mtime     = excluded.mtime,
+                    md5_hash  = excluded.md5_hash,
+                    last_seen = excluded.last_seen
+            """, (_normalize(path), size, mtime, md5_hash, now))
         self._mark_dirty()
 
     def upsert_snapshots_batch(self, snapshots: list):
@@ -254,23 +292,27 @@ class Database:
             return
 
         now = datetime.now().isoformat()
-        self.conn.executemany("""
-            INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                size      = excluded.size,
-                mtime     = excluded.mtime,
-                md5_hash  = excluded.md5_hash,
-                last_seen = excluded.last_seen
-        """, [(_normalize(p), s, m, h, now) for p, s, m, h in snapshots])
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.executemany("""
+                INSERT INTO snapshots (path, size, mtime, md5_hash, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    size      = excluded.size,
+                    mtime     = excluded.mtime,
+                    md5_hash  = excluded.md5_hash,
+                    last_seen = excluded.last_seen
+            """, [(_normalize(p), s, m, h, now) for p, s, m, h in snapshots])
+            self.conn.commit()
 
     def delete_snapshot(self, path: str):
         """
         Removes a file from the snapshot table.
         Called when a file is confirmed deleted or moved away from its old path.
         """
-        self.conn.execute("DELETE FROM snapshots WHERE path = ?", (_normalize(path),))
+        with self._db_lock:
+            self.conn.execute(
+                "DELETE FROM snapshots WHERE path = ?", (_normalize(path),)
+            )
         self._mark_dirty()
 
     def delete_snapshots_batch(self, paths: list):
@@ -279,11 +321,12 @@ class Database:
         """
         if not paths:
             return
-        self.conn.executemany(
-            "DELETE FROM snapshots WHERE path = ?",
-            [(_normalize(p),) for p in paths]
-        )
-        self.conn.commit()
+        with self._db_lock:
+            self.conn.executemany(
+                "DELETE FROM snapshots WHERE path = ?",
+                [(_normalize(p),) for p in paths]
+            )
+            self.conn.commit()
 
     def get_all_snapshots(self) -> dict:
         """
@@ -292,12 +335,14 @@ class Database:
         Used during startup diff to compare against the current directory state.
         Paths are returned as-stored (already normalized to lowercase).
         """
-        cursor = self.conn.execute(
-            "SELECT path, size, mtime, md5_hash FROM snapshots"
-        )
+        with self._db_lock:
+            cursor = self.conn.execute(
+                "SELECT path, size, mtime, md5_hash FROM snapshots"
+            )
+            rows = cursor.fetchall()
         return {
             row[0]: {"size": row[1], "mtime": row[2], "md5_hash": row[3]}
-            for row in cursor.fetchall()
+            for row in rows
         }
 
     # ------------------------------------------------------------------
@@ -324,12 +369,13 @@ class Database:
         whichever comes first.
         """
         timestamp = datetime.now().isoformat()
-        self.conn.execute("""
-            INSERT INTO events (timestamp, event_type, src_path, dest_path,
-                                file_size, md5_hash, prev_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (timestamp, event_type, _normalize(src_path), _normalize(dest_path),
-              file_size, md5_hash, prev_hash))
+        with self._db_lock:
+            self.conn.execute("""
+                INSERT INTO events (timestamp, event_type, src_path, dest_path,
+                                    file_size, md5_hash, prev_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, event_type, _normalize(src_path), _normalize(dest_path),
+                  file_size, md5_hash, prev_hash))
         self._mark_dirty()
 
         if dest_path:
@@ -347,19 +393,37 @@ class Database:
         Snapshots are never purged — they represent current file state.
         Called once on every startup before the diff runs.
         Uses the idx_events_timestamp index for fast deletion.
+
+        retention_days semantics:
+          > 0  purge events older than N days.
+          = 0  keep all events indefinitely; no purge performed.
+          < 0  invalid — almost certainly a config typo; logs a warning.
         """
-        if retention_days <= 0:
+        if retention_days < 0:
+            log.warning(
+                "retention_days is %d (negative) — skipping purge. "
+                "Set to 0 to keep all events indefinitely, "
+                "or a positive integer to enable cleanup.",
+                retention_days,
+            )
+            return
+
+        if retention_days == 0:
+            log.info("retention_days = 0: keeping all events indefinitely.")
             return
 
         cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
-        cursor = self.conn.execute(
-            "DELETE FROM events WHERE timestamp < ?", (cutoff,)
-        )
-        self.conn.commit()
+        with self._db_lock:
+            cursor = self.conn.execute(
+                "DELETE FROM events WHERE timestamp < ?", (cutoff,)
+            )
+            self.conn.commit()
 
         if cursor.rowcount:
             log.info("Purged %d event(s) older than %d day(s).",
                      cursor.rowcount, retention_days)
+        else:
+            log.info("No events older than %d day(s) to purge.", retention_days)
 
     # ------------------------------------------------------------------
     # CONFIG TABLE OPERATIONS
@@ -378,17 +442,19 @@ class Database:
                         not required.
         """
         now = datetime.now().isoformat()
-        self.conn.execute("""
-            INSERT INTO config (key, value, updated)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value   = excluded.value,
-                updated = excluded.updated
-        """, (key, value, now))
+        with self._db_lock:
+            self.conn.execute("""
+                INSERT INTO config (key, value, updated)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value   = excluded.value,
+                    updated = excluded.updated
+            """, (key, value, now))
 
-        if immediate:
-            self.conn.commit()
-        else:
+            if immediate:
+                self.conn.commit()
+
+        if not immediate:
             self._mark_dirty()
 
     def get_config(self, key: str) -> str | None:
@@ -396,10 +462,11 @@ class Database:
         Returns the value for a given config key.
         Returns None if the key does not exist.
         """
-        cursor = self.conn.execute(
-            "SELECT value FROM config WHERE key = ?", (key,)
-        )
-        row = cursor.fetchone()
+        with self._db_lock:
+            cursor = self.conn.execute(
+                "SELECT value FROM config WHERE key = ?", (key,)
+            )
+            row = cursor.fetchone()
         return row[0] if row else None
 
     # ------------------------------------------------------------------
@@ -408,4 +475,5 @@ class Database:
 
     def close(self):
         self.flush()
-        self.conn.close()
+        with self._db_lock:
+            self.conn.close()
