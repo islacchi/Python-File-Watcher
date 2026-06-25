@@ -60,6 +60,14 @@ class FileWatchHandler(FileSystemEventHandler):
         #      same MD5 — a hash-only key causes the second deletion to
         #      silently clobber the first.
         self.pending_deletes: dict[tuple, tuple] = {}
+        # pending_creates: { md5_hash: (new_path, deadline_timestamp) }
+        # Handles CREATE-before-DELETE move ordering on UNC network shares.
+        # ReadDirectoryChangesW over SMB can fire the CREATE event before the
+        # DELETE event for the same move operation — sometimes seconds apart.
+        # When on_created finds no matching pending delete, it parks the new
+        # file here. on_deleted then checks pending_creates for a hash match
+        # and resolves it as a MOVE instead of logging DELETED + CREATED.
+        self.pending_creates: dict[str, tuple] = {}
         self.move_window: float    = config["watcher"].getfloat("move_window", 2.0)
         self.watch_directory: str  = config["watcher"]["watch_directory"]
 
@@ -134,6 +142,16 @@ class FileWatchHandler(FileSystemEventHandler):
                     self.db.log_event("DELETED", orig_path)
                     self.db.delete_snapshot(orig_path)
 
+                # Sweep expired pending_creates — log them as genuine CREATEs
+                creates_to_flush = [
+                    (h, path, deadline)
+                    for h, (path, deadline) in self.pending_creates.items()
+                    if now >= deadline
+                ]
+                for file_hash, new_path, _ in creates_to_flush:
+                    self.pending_creates.pop(file_hash, None)
+                    self.db.log_event("CREATED", new_path)
+
 
     def _find_pending_delete_key(
         self, new_path: str, file_hash: str | None
@@ -172,16 +190,25 @@ class FileWatchHandler(FileSystemEventHandler):
         size, mtime = get_file_info(path)
 
         with self._lock:
-                    match_key = self._find_pending_delete_key(path, file_hash)
-                    if match_key is not None:
-                        old_path, _ = self.pending_deletes.pop(match_key)
-                        event_type  = classify_path_change(old_path, path)
-                        self.db.log_event(event_type, old_path, dest_path=path,
-                                        file_size=size, md5_hash=file_hash)
-                        self.db.delete_snapshot(old_path)
-                    else:
-                        self.db.log_event("CREATED", path,
-                                        file_size=size, md5_hash=file_hash)
+            match_key = self._find_pending_delete_key(path, file_hash)
+            if match_key is not None:
+                # DELETE already arrived — resolve as MOVE immediately
+                old_path, _ = self.pending_deletes.pop(match_key)
+                event_type  = classify_path_change(old_path, path)
+                self.db.log_event(event_type, old_path, dest_path=path,
+                                  file_size=size, md5_hash=file_hash)
+                self.db.delete_snapshot(old_path)
+            elif file_hash is not None:
+                # DELETE hasn't arrived yet — park this CREATE and wait
+                deadline = time.time() + self.move_window
+                self.pending_creates[file_hash] = (path, deadline)
+                # Snapshot the new file so it's tracked regardless of outcome
+                if size is not None:
+                    self.db.upsert_snapshot(path, size, mtime, file_hash)
+                return
+            else:
+                self.db.log_event("CREATED", path,
+                                  file_size=size, md5_hash=file_hash)
 
         if size is not None:
             self.db.upsert_snapshot(path, size, mtime, file_hash)
@@ -234,7 +261,18 @@ class FileWatchHandler(FileSystemEventHandler):
         key      = (os.path.normcase(path), file_hash)
         deadline = time.time() + self.move_window
         with self._lock:
-            self.pending_deletes[key] = (path, deadline)
+            # Check if CREATE already arrived for this hash
+            if file_hash and file_hash in self.pending_creates:
+                new_path, _ = self.pending_creates.pop(file_hash)
+                event_type  = classify_path_change(path, new_path)
+                self.db.log_event(event_type, path, dest_path=new_path,
+                                  md5_hash=file_hash)
+                self.db.delete_snapshot(path)
+            else:
+                # CREATE hasn't arrived yet — park this DELETE and wait
+                key      = (os.path.normcase(path), file_hash)
+                deadline = time.time() + self.move_window
+                self.pending_deletes[key] = (path, deadline)
 
     def on_moved(self, event):
         """
