@@ -122,22 +122,39 @@ class Database:
 
     def _migrate(self):
         """
-        Adds prev_hash column to the events table if it does not exist yet.
-        Handles databases created before this column was introduced — safe
-        to call on every startup, does nothing if column already exists.
+        Runs all incremental migrations on every startup.
+        Every migration uses IF NOT EXISTS or checks before altering so it
+        is safe to call repeatedly — already-applied migrations are no-ops.
+
+        Migrations:
+          1. prev_hash column — added for before/after hash comparison on MODIFIED
+          2. idx_events_event_type — added for fast tab and type filter queries
+          3. idx_events_src_path   — added for fast path search queries
         """
         with self._db_lock:
-            existing = {
+            # Migration 1: prev_hash column
+            existing_cols = {
                 row[1] for row in
                 self.conn.execute("PRAGMA table_info(events)").fetchall()
             }
-            if "prev_hash" not in existing:
+            if "prev_hash" not in existing_cols:
                 self.conn.execute(
                     "ALTER TABLE events ADD COLUMN prev_hash TEXT"
                 )
                 self.conn.commit()
-        if "prev_hash" not in existing:       
-            log.info("Migrated events table: added prev_hash column.")
+                log.info("Migration: added prev_hash column to events table.")
+
+            # Migration 2 & 3: performance indexes
+            # CREATE INDEX IF NOT EXISTS is a no-op if the index already exists.
+            # Runs on every startup so existing databases created before these
+            # indexes were introduced are upgraded automatically.
+            self.conn.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_events_event_type
+                    ON events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_events_src_path
+                    ON events(src_path);
+            """)
+            log.info("Migration: verified performance indexes on events table.")
 
     # ------------------------------------------------------------------
     # BATCHED COMMIT
