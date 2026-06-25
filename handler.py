@@ -186,8 +186,19 @@ class FileWatchHandler(FileSystemEventHandler):
             return
 
         path      = event.src_path
-        file_hash = compute_hash(path, self.hash_algorithm)
-        size, mtime = get_file_info(path)
+
+        # On UNC network shares, the CREATE event fires before the file
+        # is fully written over SMB. Retry hashing up to 5 times with a
+        # short delay to give the transfer time to complete.
+        file_hash = None
+        size, mtime = None, None
+        for attempt in range(5):
+            file_hash = compute_hash(path, self.hash_algorithm)
+            size, mtime = get_file_info(path)
+            if file_hash is not None:
+                break
+            log.debug("Hash not ready for %s (attempt %d/5), retrying...", path, attempt + 1)
+            time.sleep(0.5)
 
         with self._lock:
             match_key = self._find_pending_delete_key(path, file_hash)
@@ -255,6 +266,7 @@ class FileWatchHandler(FileSystemEventHandler):
 
         path      = event.src_path
         file_hash = self.db.get_snapshot_hash(path)
+        log.info("DEBUG on_deleted hash: %s for %s", file_hash, path)
 
         # Key is (normcase_path, hash) — unique per source file even when
         # hash is None or when multiple files share the same hash.
