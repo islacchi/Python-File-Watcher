@@ -26,8 +26,11 @@ filewatcher/
 ├── config.ini        ← your configuration (edit this)
 ├── main.py           ← entry point
 ├── db.py             ← SQLite database layer
+├── diff.py           ← startup diff and directory scanner
 ├── handler.py        ← live watchdog event handler
 ├── logger.py         ← centralized logging setup
+├── utils.py          ← shared hashing and path utilities
+├── watcher.py        ← observer startup and reconnect loop
 ├── query.py          ← CLI tool for reading logs
 ├── .gitignore        ← excludes cache, db, and log files from git
 └── requirements.txt  ← Python dependencies
@@ -48,7 +51,7 @@ pip install -r requirements.txt
 
 ### 3. Edit config.ini
 Change at minimum:
-- `watch_directory` → the folder you want to monitor (can be a network drive e.g. `K:\`)
+- `watch_directory` → the folder you want to monitor (can be a UNC path e.g. `\\server\share`)
 - `log_directory`   → where the SQLite database and log file will be saved (keep OUTSIDE watch_directory)
 
 > **Note on large drives:** If `watch_directory` points to the root of a large drive or
@@ -72,13 +75,14 @@ All settings live in `config.ini`. No code changes needed.
 | `watch_directory` | `[watcher]` | — | Full path to the directory to monitor |
 | `recursive` | `[watcher]` | `true` | Watch subdirectories recursively |
 | `reconnect_delay` | `[watcher]` | `30` | Seconds to wait before retrying if drive goes offline |
-| `move_window` | `[watcher]` | `10` | Seconds to poll for a matching file after DELETE before confirming it as a delete |
-| `heartbeat_interval` | `[watcher]` | `30` | Seconds between heartbeat writes to the config table (used by Laravel UI health check) |
+| `move_window` | `[watcher]` | `10` | Seconds to hold unmatched creates/deletes before confirming them as genuine events |
+| `heartbeat_interval` | `[watcher]` | `5` | Seconds between heartbeat writes to the config table (used by Laravel UI health check) |
 | `watch_extensions` | `[filters]` | see file | Whitelist of file extensions to track |
 | `ignore_prefixes` | `[filters]` | `~$, .~, ~` | Filename prefixes to ignore (Office lock files) |
+| `exclude_directories` | `[filters]` | — | Directory names or paths to skip entirely |
 | `log_directory` | `[storage]` | — | Where to save `filelog.db` and `filewatcher.log` |
 | `db_name` | `[storage]` | `filelog.db` | SQLite database filename |
-| `retention_days` | `[storage]` | `90` | Days to keep events before auto-purge (0 = keep forever) |
+| `retention_days` | `[storage]` | `0` | Days to keep events before auto-purge (0 = keep forever) |
 | `hash_algorithm` | `[snapshot]` | `md5` | Hashing algorithm for file fingerprinting |
 
 ---
@@ -119,7 +123,7 @@ Download free from https://sqlitebrowser.org. Open `filelog.db` from your
 
 ```python
 import sqlite3
-conn = sqlite3.connect(r"C:\Users\primelink\Desktop\LOGS\filelog.db")
+conn = sqlite3.connect(r"C:\path\to\LOGS\filelog.db")
 for row in conn.execute("SELECT * FROM events ORDER BY timestamp DESC LIMIT 50"):
     print(row)
 ```
@@ -177,6 +181,11 @@ SELECT * FROM events WHERE event_type LIKE '%offline%'
 SELECT * FROM events WHERE src_path LIKE '%filename.pdf%'
 ```
 
+**Find all events sharing the same file version:**
+```sql
+SELECT * FROM events WHERE md5_hash = 'paste_hash_here'
+```
+
 **Events from a specific date:**
 ```sql
 SELECT * FROM events WHERE timestamp LIKE '2026-05-26%'
@@ -191,10 +200,27 @@ false-positive `DELETED (offline)` events on Windows network drives where
 `os.walk()` and the stored snapshot may return the same path in different
 cases (e.g. `\\Kyle\bid docs\` vs `\\kyle\bid docs\`).
 
+> **Note:** The original casing of filenames and directories is not preserved
+> in the database. This is intentional — see Known Limitations below.
+
 > **If you reset the snapshots table** (e.g. `DELETE FROM snapshots`), the next
 > startup will log every existing file as `CREATED (offline)`. This is expected
 > and only happens once — the snapshot rebuilds itself on that restart and all
 > subsequent startups will diff correctly.
+
+---
+
+## Companion UI
+
+A Laravel web interface for this script is available at:
+
+```bash
+git clone https://github.com/islacchi/File-Watcher.git
+```
+
+It reads directly from `filelog.db` and provides a dashboard, analytics charts,
+events log with hash-based file lineage search, snapshot browser, and live
+health monitoring via the heartbeat and status keys.
 
 ---
 
@@ -210,6 +236,7 @@ tools such as the Laravel UI:
 | `retention_days` | Current retention setting |
 | `script_version` | Version string from `main.py` |
 | `started_at` | ISO 8601 timestamp of last startup |
+| `status` | `scanning` during startup diff, `live` when active, `offline` on clean shutdown |
 | `heartbeat` | ISO 8601 timestamp updated every `heartbeat_interval` seconds — used to determine if the script is currently alive |
 
 ---
@@ -220,33 +247,33 @@ tools such as the Laravel UI:
 python main.py
       │
       ▼
-Load config.ini          [main.py]
+Load config.ini          [config.py]
       │
       ▼
 Setup logging            [logger.py]  → filewatcher.log + console
       │
       ▼
-Watch dir available?     [main.py]    → waits if K:\ not mounted yet
+Watch dir available?     [main.py]    → waits if drive not mounted yet
       │
       ▼
-Open / create database   [db.py]      → filelog.db, creates tables
+Open / create database   [db.py]      → filelog.db, creates tables + indexes
       │
       ▼
 Purge old events         [db.py]      → deletes rows older than retention_days
-      │
+      │                               → 0 = keep forever
       ▼
 ── STARTUP DIFF ──────────────────────────────────────────────────
       │
       ▼
-Scan watch directory     [main.py]    → normalize paths to lowercase
+Scan watch directory     [diff.py]    → normalize paths to lowercase
       │                               → mtime pre-filter → reuse stored hash
       │                               → parallel hash remaining files + ETA
       ▼
-Diff snapshot vs disk    [main.py]    → hash match: RENAMED / MOVED /
+Diff snapshot vs disk    [diff.py]    → hash match: RENAMED / MOVED /
       │                                 MOVED_AND_RENAMED / CREATED / DELETED
       ▼
-Log offline events       [db.py]      → db.log_event() + update snapshots
-      │                               → db.flush() ensures commit before returning
+Log offline events       [db.py]      → log_events_batch() + upsert_snapshots_batch()
+      │                               → db.flush() ensures single commit
       ▼
 ── HEARTBEAT ─────────────────────────────────────────────────────
       │
@@ -257,22 +284,36 @@ Heartbeat thread starts  [main.py]    → daemon thread, upserts config.heartbea
 ── LIVE WATCHER ──────────────────────────────────────────────────
       │
       ▼
-Watchdog observer starts [handler.py] → attached to watch_dir
+Watchdog observer starts [watcher.py] → attached to watch_dir, auto-reconnects
       │
       ▼ (loops on every file system event)
 File system event fires  [handler.py] → on_created / on_modified
       │                                  on_deleted / on_moved
       ▼
-Extension + prefix filter             → skip ~$ prefixes, check whitelist
+Extension + prefix filter             → skip ignore_prefixes, check whitelist
       │
       ▼
-Classify event           [handler.py] → DELETED held in pending_deletes dict
-      │                               → single sweep thread checks expiry
-      │                               → hash match found → RENAMED / MOVED
-      │                               → window expires → confirmed DELETE
+Classify event           [handler.py]
+      │
+      │  on_deleted  → hash stored in pending_deletes (path, hash) composite key
+      │               → sweep thread confirms DELETE after move_window expires
+      │
+      │  on_created  → retries compute_hash up to 5x with 0.5s delay
+      │               → (UNC shares fire CREATE before file is fully written)
+      │               → checks pending_deletes for hash match → MOVED/RENAMED
+      │               → no match yet → parks in pending_creates and waits
+      │
+      │  on_deleted  → also checks pending_creates for CREATE-before-DELETE
+      │  (cont.)       moves (SMB can fire CREATE before DELETE on UNC paths)
+      │               → hash match found → MOVED/RENAMED logged immediately
+      │
+      │  on_moved    → watchdog sees both sides → clean MOVED/RENAMED, no
+      │               hash matching needed
       ▼
-Log live event           [db.py]      → db.log_event() + upsert_snapshot()
+Log live event           [db.py]      → log_event() + upsert_snapshot()
       │                               → all paths normalized to lowercase
+      │                               → writes batched, committed every 50
+      │                                 writes or 1 second, whichever first
       │
       └──────────────────────────────── loops back to next event
 
@@ -288,22 +329,19 @@ python query.py          [query.py]   → reads filelog.db directly
 
 - **First run on large drives is slow** — every matching file must be MD5 hashed to build the initial snapshot. On a network drive with thousands of files this can take several minutes. Every run after the first is fast due to the mtime pre-filter.
 
-- **Move detection window** — when a file is deleted and recreated (cross-folder move), the script polls the watch directory every second for up to `move_window` seconds looking for a file with a matching hash. The MOVED event is logged the moment the file finishes copying — not after a blind wait. If no match is found within the window, it is confirmed as a DELETE. Increase `move_window` in `config.ini` if large files on slow network drives are still being logged as DELETE + CREATE instead of MOVED.
+- **Move detection on UNC network shares** — Windows SMB can fire the `CREATE` event before the `DELETE` event for the same move operation, sometimes seconds apart. The script handles both orderings: DELETE-first moves are resolved via `pending_deletes`, CREATE-first moves are resolved via `pending_creates`. If no matching event arrives within `move_window` seconds, the events are confirmed as genuine CREATED and DELETED. Increase `move_window` in `config.ini` if moves on slow network drives are still not being detected correctly.
 
-- **Bulk operations may cause missed live events (Windows)** — on Windows,
-  watchdog uses the `ReadDirectoryChangesW` API which has a fixed-size event
-  buffer. If a large number of files change simultaneously (e.g. a bulk copy
-  or mass rename operation), the buffer can overflow and watchdog will silently
-  miss some live events. This does not cause data corruption — any missed events
-  will be detected and logged as `(offline)` variants on the next restart when
-  the startup diff compares the snapshot against the current drive state.
-  There is no workaround within the script itself; this is an OS-level constraint.
+- **SMB file write lag** — on UNC network shares, the `CREATE` event can fire before the file's contents are fully written over the network. The script retries hashing the new file up to 5 times with a 0.5 second delay to give the transfer time to complete before attempting hash-based move resolution.
+
+- **Bulk operations may cause missed live events (Windows)** — watchdog uses the `ReadDirectoryChangesW` API which has a fixed-size event buffer. If a large number of files change simultaneously (e.g. a bulk copy or mass rename), the buffer can overflow and watchdog will silently miss some live events. Any missed events will be detected and logged as `(offline)` variants on the next restart when the startup diff runs. This is an OS-level constraint with no workaround within the script.
 
 - **Network drive hashing is slower than local** — MD5 hashing over a network connection is limited by network bandwidth, not disk speed. Pointing `watch_directory` to a specific subfolder rather than the drive root significantly reduces startup time.
 
 - **No content logging** — the script records that a file changed and its MD5 hash, but does not store the file's contents or a diff of what changed inside it.
 
 - **Paths stored as lowercase** — all paths in the database are normalized to lowercase. This is intentional (see Path Normalization above) but means the original casing of filenames and directories is not preserved in the log.
+
+- **MODIFIED events on UNC shares** — many applications (Word, Excel) do not write to files in place. They write to a temp file and swap it in, which watchdog sees as DELETE + CREATE rather than MODIFIED. On UNC network shares this is common. The startup diff correctly identifies these as MODIFIED (offline) on the next restart by comparing hashes.
 
 ---
 
@@ -330,8 +368,9 @@ To run automatically on startup:
    - UNCHECK: "Stop the task if it runs longer than 3 days"
    - Select: "Do not start a new instance" if already running
 
-> **Network drives:** If `K:\` is not mounted yet when the script starts at boot,
-> the script will wait patiently until the drive becomes available rather than crashing.
+> **Network drives:** If the watched share is not mounted yet when the script
+> starts at boot, the script will wait patiently until the path becomes
+> available rather than crashing.
 
 ---
 
