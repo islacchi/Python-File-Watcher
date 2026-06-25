@@ -76,39 +76,40 @@ class Database:
         Creates both tables if they don't exist yet.
         Safe to call on every startup — IF NOT EXISTS prevents duplicates.
         """
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                path        TEXT    UNIQUE NOT NULL,
-                size        INTEGER,
-                mtime       REAL,
-                md5_hash    TEXT,
-                last_seen   TEXT
-            );
+        with self._db_lock:
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS snapshots (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path        TEXT    UNIQUE NOT NULL,
+                    size        INTEGER,
+                    mtime       REAL,
+                    md5_hash    TEXT,
+                    last_seen   TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp   TEXT    NOT NULL,
-                event_type  TEXT    NOT NULL,
-                src_path    TEXT    NOT NULL,
-                dest_path   TEXT,
-                file_size   INTEGER,
-                md5_hash    TEXT,
-                prev_hash   TEXT
-            );
+                CREATE TABLE IF NOT EXISTS events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp   TEXT    NOT NULL,
+                    event_type  TEXT    NOT NULL,
+                    src_path    TEXT    NOT NULL,
+                    dest_path   TEXT,
+                    file_size   INTEGER,
+                    md5_hash    TEXT,
+                    prev_hash   TEXT
+                );
 
-            -- Fast lookup for purge_old_events()
-            CREATE INDEX IF NOT EXISTS idx_events_timestamp
-                ON events(timestamp);
+                -- Fast lookup for purge_old_events()
+                CREATE INDEX IF NOT EXISTS idx_events_timestamp
+                    ON events(timestamp);
 
-            -- config table: stores script metadata readable by the Laravel UI
-            -- One row per key, upserted on every startup                    
-            CREATE TABLE IF NOT EXISTS config (
-                key         TEXT UNIQUE NOT NULL,
-                value       TEXT,
-                updated     TEXT
-            );
-        """)
+                -- config table: stores script metadata readable by the Laravel UI
+                -- One row per key, upserted on every startup                    
+                CREATE TABLE IF NOT EXISTS config (
+                    key         TEXT UNIQUE NOT NULL,
+                    value       TEXT,
+                    updated     TEXT
+                );
+            """)
         self.conn.commit()
 
     def _migrate(self):
@@ -135,13 +136,15 @@ class Database:
     # ------------------------------------------------------------------
 
     def _maybe_flush(self):
-        """Commit if we've accumulated enough writes since last flush."""
-        with self._flush_lock:
-            if self._write_count > 0:
-                self._write_count = 0
-                with self._db_lock:
-                    self.conn.commit()
-        self._start_timer()
+            """
+            Lock ordering: always acquire _flush_lock before _db_lock.
+            """
+            with self._flush_lock:
+                self._write_count += 1
+                if self._write_count >= self._flush_interval:
+                    self._write_count = 0
+                    with self._db_lock:
+                        self.conn.commit()
 
     def _start_timer(self):
         """Start a background timer that flushes every 1 second."""
@@ -154,11 +157,11 @@ class Database:
         self._flush_timer.start()
 
     def _timed_flush(self):
-        """Called by the timer thread — commits pending writes."""
         with self._flush_lock:
             if self._write_count > 0:
                 self._write_count = 0
-                self.conn.commit()
+                with self._db_lock:
+                    self.conn.commit()
         self._start_timer()
 
     def _mark_dirty(self):
