@@ -36,6 +36,33 @@ def _normalize(path: str) -> str:
     return path.lower() if path else path
 
 
+def _extract_extension(path: str) -> str | None:
+    """
+    Extracts a lowercase file extension from a path, mirroring the
+    PHP pathinfo(PATHINFO_EXTENSION) logic that used to run in
+    EventService::getAnalyticsTopExtensions() — same rule: text after
+    the last dot in the last path segment only (so "archive.tar.gz"
+    -> "gz", not "tar.gz").
+
+    Returns None if there's no extension (dotfiles like ".gitignore"
+    are treated as extensionless, matching the original PHP filter that
+    skipped rows where the extracted extension was empty).
+
+    Path should already be normalized (lowercased) before calling this,
+    since it's meant to be computed once at write time and stored
+    alongside the already-lowercased src_path.
+    """
+    if not path:
+        return None
+    basename = path.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in basename or basename.startswith("."):
+        return None
+    ext = basename.rsplit(".", 1)[-1].strip()
+    return ext or None
+
+
+
+
 class Database:
     def __init__(self, db_path: str):
         """
@@ -95,7 +122,8 @@ class Database:
                     dest_path   TEXT,
                     file_size   INTEGER,
                     md5_hash    TEXT,
-                    prev_hash   TEXT
+                    prev_hash   TEXT,
+                    extension   TEXT
                 );
 
                 -- Fast range queries in purge_old_events() and date filters
@@ -130,19 +158,37 @@ class Database:
           1. prev_hash column — added for before/after hash comparison on MODIFIED
           2. idx_events_event_type — added for fast tab and type filter queries
           3. idx_events_src_path   — added for fast path search queries
+          4. extension column + idx_events_extension — added so
+             getAnalyticsTopExtensions() can GROUP BY extension directly in
+             SQL instead of pulling every distinct src_path into PHP and
+             parsing extensions there. Backfilled once for existing rows;
+             completion is tracked in the config table so restarts after
+             the initial backfill don't rescan the whole table.
         """
         with self._db_lock:
-            # Migration 1: prev_hash column
             existing_cols = {
                 row[1] for row in
                 self.conn.execute("PRAGMA table_info(events)").fetchall()
             }
+
+            # Migration 1: prev_hash column
             if "prev_hash" not in existing_cols:
                 self.conn.execute(
                     "ALTER TABLE events ADD COLUMN prev_hash TEXT"
                 )
                 self.conn.commit()
                 log.info("Migration: added prev_hash column to events table.")
+
+            # Migration 4a: extension column (backfill happens after the
+            # lock is released — see below)
+            extension_col_added = False
+            if "extension" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE events ADD COLUMN extension TEXT"
+                )
+                self.conn.commit()
+                extension_col_added = True
+                log.info("Migration: added extension column to events table.")
 
             # Migration 2 & 3: performance indexes
             # CREATE INDEX IF NOT EXISTS is a no-op if the index already exists.
@@ -153,8 +199,57 @@ class Database:
                     ON events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_events_src_path
                     ON events(src_path);
+                CREATE INDEX IF NOT EXISTS idx_events_extension
+                    ON events(extension);
             """)
             log.info("Migration: verified performance indexes on events table.")
+
+        # Backfill runs outside the lock above (get_config/upsert_config/
+        # the backfill loop each take the lock themselves per-call) —
+        # this method's lock is a plain threading.Lock, not reentrant,
+        # so nesting a locked call inside the block above would deadlock.
+        if extension_col_added or self.get_config("extension_backfill_done") != "1":
+            self._backfill_extension_column()
+            self.upsert_config("extension_backfill_done", "1")
+
+    def _backfill_extension_column(self):
+        """
+        One-time backfill of the extension column for rows written before
+        this migration existed. Walks the table in id order (using the
+        implicit rowid index, not a full scan) so it stays fast even on
+        a large events table, and commits per batch rather than holding
+        one giant transaction.
+        """
+        BATCH = 2000
+        last_id = 0
+        total = 0
+        while True:
+            with self._db_lock:
+                rows = self.conn.execute(
+                    "SELECT id, src_path FROM events WHERE id > ? ORDER BY id LIMIT ?",
+                    (last_id, BATCH),
+                ).fetchall()
+            if not rows:
+                break
+
+            updates = [
+                (_extract_extension(src_path), row_id)
+                for row_id, src_path in rows
+            ]
+            with self._db_lock:
+                self.conn.executemany(
+                    "UPDATE events SET extension = ? WHERE id = ?",
+                    updates,
+                )
+                self.conn.commit()
+
+            last_id = rows[-1][0]
+            total += len(rows)
+            if len(rows) < BATCH:
+                break
+
+        if total:
+            log.info("Migration: backfilled extension column for %d events.", total)
 
     # ------------------------------------------------------------------
     # BATCHED COMMIT
@@ -224,24 +319,25 @@ class Database:
             return
 
         now = datetime.now().isoformat()
-        rows = [
-            (
+        rows = []
+        for e in events:
+            src_path = _normalize(e.get("src_path"))
+            rows.append((
                 now,
                 e.get("event_type"),
-                _normalize(e.get("src_path")),
+                src_path,
                 _normalize(e.get("dest_path")),
                 e.get("file_size"),
                 e.get("md5_hash"),
                 e.get("prev_hash"),
-            )
-            for e in events
-        ]
+                _extract_extension(src_path),
+            ))
 
         with self._db_lock:
             self.conn.executemany("""
                 INSERT INTO events (timestamp, event_type, src_path, dest_path,
-                                    file_size, md5_hash, prev_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    file_size, md5_hash, prev_hash, extension)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, rows)
         self._mark_dirty()
 
@@ -369,13 +465,14 @@ class Database:
         whichever comes first.
         """
         timestamp = datetime.now().isoformat()
+        normalized_src = _normalize(src_path)
         with self._db_lock:
             self.conn.execute("""
                 INSERT INTO events (timestamp, event_type, src_path, dest_path,
-                                    file_size, md5_hash, prev_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (timestamp, event_type, _normalize(src_path), _normalize(dest_path),
-                  file_size, md5_hash, prev_hash))
+                                    file_size, md5_hash, prev_hash, extension)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (timestamp, event_type, normalized_src, _normalize(dest_path),
+                  file_size, md5_hash, prev_hash, _extract_extension(normalized_src)))
         self._mark_dirty()
 
         if dest_path:
