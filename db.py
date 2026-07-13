@@ -39,18 +39,15 @@ def _normalize(path: str) -> str:
 def _extract_extension(path: str) -> str | None:
     """
     Extracts a lowercase file extension from a path, mirroring the
-    PHP pathinfo(PATHINFO_EXTENSION) logic that used to run in
+    PHP pathinfo(PATHINFO_EXTENSION) logic used in
     EventService::getAnalyticsTopExtensions() — same rule: text after
     the last dot in the last path segment only (so "archive.tar.gz"
     -> "gz", not "tar.gz").
 
     Returns None if there's no extension (dotfiles like ".gitignore"
-    are treated as extensionless, matching the original PHP filter that
-    skipped rows where the extracted extension was empty).
+    are treated as extensionless).
 
-    Path should already be normalized (lowercased) before calling this,
-    since it's meant to be computed once at write time and stored
-    alongside the already-lowercased src_path.
+    Path should already be normalized (lowercased) before calling this.
     """
     if not path:
         return None
@@ -163,6 +160,11 @@ class Database:
              parsing extensions there. Backfilled once for existing rows;
              completion is tracked in the config table so restarts after
              the initial backfill don't rescan the whole table.
+          5. idx_events_timestamp_event_type — composite index so analytics
+             queries that filter by timestamp range AND group by event_type
+             in the same query don't fall back to a full scan on the second
+             dimension (SQLite can generally only use one single-column
+             index per table per query).
         """
         with self._db_lock:
             existing_cols = {
@@ -189,7 +191,7 @@ class Database:
                 extension_col_added = True
                 log.info("Migration: added extension column to events table.")
 
-            # Migration 2 & 3: performance indexes
+            # Migration 2, 3, 4b, 5: performance indexes
             # CREATE INDEX IF NOT EXISTS is a no-op if the index already exists.
             # Runs on every startup so existing databases created before these
             # indexes were introduced are upgraded automatically.
@@ -250,7 +252,7 @@ class Database:
                 break
 
         if total:
-            log.info("Migration: backfilled extension column for %d events.", total)
+            log.info("Migration: backfilled extension column for %d events.", total)    
 
     # ------------------------------------------------------------------
     # BATCHED COMMIT
@@ -475,11 +477,6 @@ class Database:
             """, (timestamp, event_type, normalized_src, _normalize(dest_path),
                   file_size, md5_hash, prev_hash, _extract_extension(normalized_src)))
         self._mark_dirty()
-
-        if dest_path:
-            log.info("%s: %s  →  %s", event_type, src_path, dest_path)
-        else:
-            log.info("%s: %s", event_type, src_path)
 
     # ------------------------------------------------------------------
     # RETENTION / CLEANUP
