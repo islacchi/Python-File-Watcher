@@ -62,7 +62,6 @@ def _extract_extension(path: str) -> str | None:
 
 
 
-
 class Database:
     def __init__(self, db_path: str):
         """
@@ -201,6 +200,8 @@ class Database:
                     ON events(src_path);
                 CREATE INDEX IF NOT EXISTS idx_events_extension
                     ON events(extension);
+                CREATE INDEX IF NOT EXISTS idx_events_timestamp_event_type
+                    ON events(timestamp, event_type);
             """)
             log.info("Migration: verified performance indexes on events table.")
 
