@@ -135,7 +135,7 @@ class Database:
                     ON events(src_path);
 
                 -- config table: stores script metadata readable by the Laravel UI
-                -- One row per key, upserted on every startup                    
+                -- One row per key, upserted on every startup
                 CREATE TABLE IF NOT EXISTS config (
                     key         TEXT UNIQUE NOT NULL,
                     value       TEXT,
@@ -252,7 +252,7 @@ class Database:
                 break
 
         if total:
-            log.info("Migration: backfilled extension column for %d events.", total)    
+            log.info("Migration: backfilled extension column for %d events.", total)
 
     # ------------------------------------------------------------------
     # BATCHED COMMIT
