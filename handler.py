@@ -266,7 +266,7 @@ class FileWatchHandler(FileSystemEventHandler):
 
         path      = event.src_path
         file_hash = self.db.get_snapshot_hash(path)
-        log.info("DEBUG on_deleted hash: %s for %s", file_hash, path)
+        log.debug("on_deleted hash: %s for %s", file_hash, path)
 
         # Key is (normcase_path, hash) — unique per source file even when
         # hash is None or when multiple files share the same hash.
